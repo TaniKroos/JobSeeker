@@ -1,0 +1,7 @@
+node_modules
+.wrangler
+.dev.vars
+.output
+.wxt
+worker-configuration.d.ts
+oc.md

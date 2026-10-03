@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Job Copilot</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header><span class="logo">JC</span><b>Job Copilot</b><span id="dot" class="dot" title=""></span></header>
+    <section id="signedOut" hidden>
+      <p>Connect once so Claude can fill applications in this browser.</p>
+      <button id="connect">Connect</button>
+    </section>
+    <section id="signedIn" hidden>
+      <p class="muted">Signed in as <b id="email"></b></p>
+      <div id="forms"></div>
+      <button id="inject" class="secondary">Use on this page</button>
+      <label class="toggle"><input id="allSites" type="checkbox" /> <span>Work on every career site<small>Chrome will ask to allow access to all sites. Job Copilot stays idle on pages without a form or job posting.</small></span></label>
+      <p class="hint">Works automatically on Greenhouse, Lever, Ashby, Workday, Oracle, SmartRecruiters, Workable, iCIMS, Taleo and Google Forms.</p>
+    </section>
+    <p id="error" class="error" hidden></p>
+    <details>
+      <summary>Settings</summary>
+      <label for="server">Server URL</label>
+      <input id="server" type="url" spellcheck="false" />
+      <button id="saveServer" class="secondary small">Save</button>
+      <p class="hint">Claude connector URL: <code id="mcpUrl"></code></p>
+      <button id="disconnect" class="link" hidden>Sign out</button>
+    </details>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

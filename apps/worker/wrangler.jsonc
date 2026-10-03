@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "job-copilot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // Custom domain (zone must be in this Cloudflare account). The workers.dev URL keeps working too.
+  "routes": [{ "pattern": "jobs.smudgee.xyz", "custom_domain": true }],
+  // Keep request URLs as localhost in `wrangler dev` (otherwise they're rewritten to the custom domain).
+  "dev": { "host": "localhost:8787" },
+  "vars": {
+    "APP_NAME": "Job Copilot",
+    // Public base URL, e.g. https://jobs.example.com. Empty = this Worker's own URL (fine for *.workers.dev).
+    "PUBLIC_URL": "",
+    // Comma-separated Chrome extension IDs allowed to sign in (empty = any, fine for development)
+    "EXTENSION_IDS": "",
+    // Shown on /privacy and /terms (e.g. support@smudgee.xyz). Empty = no contact line.
+    "CONTACT_EMAIL": ""
+  },
+  // OAuth grants/tokens for the Claude/ChatGPT connector (required by workers-oauth-provider).
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "job_copilot", "migrations_dir": "migrations" }
+  ],
+  // One "room" per user: live extension connection + captured forms.
+  "durable_objects": {
+    "bindings": [{ "name": "USER_ROOM", "class_name": "UserRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserRoom"] }]
+}

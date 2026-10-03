@@ -1,0 +1,27 @@
+{
+  "name": "worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply job_copilot --local",
+    "db:migrate:remote": "wrangler d1 migrations apply job_copilot --remote",
+    "typecheck": "tsc --noEmit",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.1",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "agents": "^0.26.0",
+    "hono": "^4.13.12",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261003.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.147.0",
+    "ws": "^8.22.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "job-copilot",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:worker": "npm run dev -w apps/worker",
+    "dev:ext": "npm run dev -w apps/extension",
+    "build:ext": "npm run build -w apps/extension",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}
