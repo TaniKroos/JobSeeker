@@ -15,7 +15,7 @@ export interface FormField {
   inputType?: string; // original input type for "text" fields (email, tel, url…)
   required: boolean;
   options?: string[]; // for select / radio / checkbox
-  value?: string | string[]; // current value on the page, if any
+  hasValue?: boolean; // whether the field already has an answer (the value itself never leaves the browser)
   placeholder?: string;
   maxLength?: number;
 }
@@ -31,6 +31,7 @@ export interface CapturedForm {
   pageTitle: string;
   fields: FormField[];
   capturedAt: number;
+  final?: boolean; // the review page with only a Submit button: nothing to fill, the user submits
 }
 
 export interface FillAnswer {
@@ -74,15 +75,7 @@ export type ExtToServer =
   | { type: "page_closed"; session: string }
   | { type: "advance_blocked"; formId: string; note: string }
   | { type: "fill_result"; requestId: string; formId: string; results: FillResult[]; advance?: AdvanceResult }
-  | {
-      type: "submitted";
-      formId: string;
-      url: string;
-      company?: string;
-      role?: string;
-      // long free-text answers the user submitted, to grow the answer bank
-      answers?: { question: string; answer: string }[];
-    };
+  | { type: "submitted"; formId: string; url: string; company?: string; role?: string };
 
 // Messages from the server to the extension.
 export type ServerToExt =

@@ -12,6 +12,8 @@ export interface JobSummary {
   url: string;
   applyUrl?: string; // page with the application form, when different from url
   updatedAt?: string;
+  postedAt?: string; // ISO date the job was first posted (best available per board)
+  postedApprox?: boolean; // true when the board only says e.g. "30+ days ago"
 }
 
 export interface JobDetails extends JobSummary {
@@ -24,7 +26,7 @@ const CACHE_SECONDS = 30 * 60;
 
 async function getJson(url: string): Promise<any | null> {
   const res = await fetch(url, {
-    headers: { accept: "application/json", "user-agent": "JobCopilot/0.1" },
+    headers: { accept: "application/json", "user-agent": "JobSeeker/1.0 (+https://jobs.smudgee.xyz)" },
     cf: { cacheTtl: CACHE_SECONDS, cacheEverything: true },
   });
   if (!res.ok) return null;
@@ -87,6 +89,7 @@ async function greenhouseJobs(board: string): Promise<JobSummary[] | null> {
     url: j.absolute_url,
     applyUrl: greenhouseApplyUrl(board, String(j.id), j.absolute_url),
     updatedAt: j.updated_at,
+    postedAt: j.first_published ?? j.updated_at,
   }));
 }
 
@@ -104,6 +107,7 @@ async function leverJobs(board: string): Promise<JobSummary[] | null> {
         url: j.hostedUrl,
         applyUrl: `${j.hostedUrl}/apply`,
         updatedAt: j.createdAt ? new Date(j.createdAt).toISOString() : undefined,
+        postedAt: j.createdAt ? new Date(j.createdAt).toISOString() : undefined,
       }));
     }
   }
@@ -127,6 +131,7 @@ async function ashbyJobs(board: string): Promise<JobSummary[] | null> {
       url: j.jobUrl,
       applyUrl: `${j.jobUrl}/application`,
       updatedAt: j.publishedAt,
+      postedAt: j.publishedAt,
     }));
 }
 
@@ -324,12 +329,13 @@ export async function searchOracle(
   keywords: string | undefined,
   location: string | undefined,
   limit: number,
+  offset = 0,
 ): Promise<{ total: number; jobs: JobSummary[]; locationNote?: string } | null> {
-  const base: Record<string, string | number> = { limit, sortBy: "POSTING_DATES_DESC" };
+  const base: Record<string, string | number> = { limit, offset, sortBy: "POSTING_DATES_DESC" };
   if (keywords) base.keyword = keywords;
   let locationNote: string | undefined;
   if (location) {
-    const facets = await oracleQuery(board, { ...base, limit: 1, facetsList: "LOCATIONS" }, "locationsFacet");
+    const facets = await oracleQuery(board, { ...base, limit: 1, offset: 0, facetsList: "LOCATIONS" }, "locationsFacet");
     const list: { Id: number; Name: string }[] = facets?.items?.[0]?.locationsFacet ?? [];
     const want = location.toLowerCase().replace(/^bangalore\b/, "bengaluru");
     const hit =
@@ -354,6 +360,7 @@ export async function searchOracle(
       department: r.JobFamily ?? undefined,
       url: oracleJobUrl(board, String(r.Id)),
       updatedAt: r.PostedDate,
+      postedAt: r.PostedDate,
     })),
   };
 }

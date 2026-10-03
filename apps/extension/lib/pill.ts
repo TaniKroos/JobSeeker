@@ -20,7 +20,7 @@ const CSS = `
 .bar i{display:block;height:100%;width:0;background:#ffd60a;transition:width .2s}
 .working .bar{display:block}
 .act{all:unset;cursor:pointer;flex:none;padding:5px 10px;border-radius:999px;background:#f5f5f7;color:#1d1d1f;font:600 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif}
-.act:hover{background:#fff}.act:focus-visible{outline:2px solid #0a84ff;outline-offset:2px}
+.act[hidden]{display:none}.act:hover{background:#fff}.act:focus-visible{outline:2px solid #0a84ff;outline-offset:2px}
 .x{all:unset;cursor:pointer;color:#8e8e93;padding:0 4px;font-size:16px;line-height:1}
 .x:hover{color:#f5f5f7}
 .hidden{opacity:0;pointer-events:none;transform:translateY(8px)}

@@ -99,7 +99,7 @@ function answersFor(fields) {
     if (f.kind === "text") {
       value = { email: "test@example.com", tel: "9876543210", url: "https://example.com", number: "1", date: "2026-10-10" }[f.type] ?? "Test";
       if (/linkedin/i.test(f.label)) value = "https://linkedin.com/in/test";
-    } else if (f.kind === "textarea") value = "This is a test answer written by the Job Copilot browser test.";
+    } else if (f.kind === "textarea") value = "This is a test answer written by the JobSeeker browser test.";
     else if (f.kind === "select") value = f.options?.[0] ?? "Yes";
     else if (f.kind === "radio") value = f.options?.[0];
     else if (f.kind === "checkbox") value = f.options?.slice(0, 1);
@@ -224,10 +224,7 @@ if (!fixture) {
   }
   const ok1 = app?.status === "Applied";
   console.log(`${ok1 ? "✓" : "✗"} after submit, tracker status = ${app?.status}`);
-  const learned = parse(await client.callTool({ name: "find_saved_answers", arguments: { question: "project proud" } }));
-  const ok2 = Array.isArray(learned) && learned.some((a) => a.answer === LONG);
-  console.log(`${ok2 ? "✓" : "✗"} submitted long answer saved to answer bank`);
-  if (!ok1 || !ok2) failures++;
+  if (!ok1) failures++;
 }
 
 await client.close();

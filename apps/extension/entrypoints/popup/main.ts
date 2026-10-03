@@ -21,6 +21,10 @@ async function render() {
   dot.title = s.connected ? "Live connection open" : "Connects when an application page is open";
   $<HTMLInputElement>("server").value = s.server;
   $<HTMLInputElement>("allSites").checked = s.allSites;
+  // The store build has no optional all-sites permission; dev builds show developer settings.
+  const manifest = browser.runtime.getManifest();
+  $("allSitesRow").hidden = !s.email || !manifest.optional_host_permissions?.length;
+  $("dev").hidden = import.meta.env.MODE === "store";
   $("mcpUrl").textContent = `${s.server}/mcp`;
   const forms = $("forms");
   forms.replaceChildren(
@@ -29,7 +33,7 @@ async function render() {
       div.className = "form";
       const b = document.createElement("b");
       b.textContent = [f.role, f.company].filter(Boolean).join(" · ") || "Application form";
-      div.append(b, document.createTextNode(`${f.step > 1 ? `Page ${f.step} · ` : ""}${f.fields} fields captured. Ask Claude to “fill it”.`));
+      div.append(b, document.createTextNode(`${f.step > 1 ? `Page ${f.step} · ` : ""}${f.fields} fields ready. Ask your assistant to “fill it”.`));
       return div;
     }),
   );

@@ -148,7 +148,7 @@ function captureGeneric(root: ParentNode): FormField[] {
       if (type === "file") {
         if (el.disabled) continue;
         const label = questionFor(el) || "File upload";
-        fields.push({ id: assignId([el], el.getAttribute(ID_ATTR)), label, kind: "file", required: isRequired(el, label, rawLabelHasStar(el)) });
+        fields.push({ id: assignId([el], el.getAttribute(ID_ATTR)), label, kind: "file", required: isRequired(el, label, rawLabelHasStar(el)), hasValue: (el.files?.length ?? 0) > 0 });
         continue;
       }
       if (!isVisible(el) && !(type === "radio" || type === "checkbox")) continue;
@@ -174,7 +174,7 @@ function captureGeneric(root: ParentNode): FormField[] {
             kind: "checkbox",
             required: el.required,
             options: [opt],
-            value: el.checked ? [opt] : [],
+            hasValue: el.checked,
           });
           continue;
         }
@@ -186,7 +186,7 @@ function captureGeneric(root: ParentNode): FormField[] {
           kind: type === "radio" ? "radio" : "checkbox",
           required: group.some((g) => g.required) || /\*/.test(label),
           options,
-          value: type === "radio" ? options[group.findIndex((g) => g.checked)] ?? "" : options.filter((_, i) => group[i]?.checked),
+          hasValue: group.some((g) => g.checked),
         });
         continue;
       }
@@ -198,7 +198,7 @@ function captureGeneric(root: ParentNode): FormField[] {
         kind: "text",
         inputType: type,
         required: isRequired(el, label, rawLabelHasStar(el)),
-        value: el.value,
+        hasValue: !!el.value.trim(),
         placeholder: el.placeholder || undefined,
         maxLength: el.maxLength > 0 ? el.maxLength : undefined,
       });
@@ -210,7 +210,7 @@ function captureGeneric(root: ParentNode): FormField[] {
         label: label || "Additional information",
         kind: "textarea",
         required: isRequired(el, label, rawLabelHasStar(el)),
-        value: el.value,
+        hasValue: !!el.value.trim(),
         maxLength: el.maxLength > 0 ? el.maxLength : undefined,
       });
     } else if (el instanceof HTMLSelectElement) {
@@ -223,11 +223,34 @@ function captureGeneric(root: ParentNode): FormField[] {
         kind: "select",
         required: isRequired(el, label, rawLabelHasStar(el)),
         options,
-        value: el.selectedIndex > 0 ? clean(el.options[el.selectedIndex]?.text) : "",
+        hasValue: el.selectedIndex > 0,
       });
     } else if (el.getAttribute("role") === "combobox" && isVisible(el)) {
       fields.push(comboField(el));
     }
+  }
+  return fields;
+}
+
+// Dropdowns rendered as a button that opens a listbox (Workday "Select One", many design systems).
+const PLACEHOLDER = /^(select( one)?|choose( one)?|please select|--.*--)$/i;
+
+function captureListboxButtons(root: ParentNode): FormField[] {
+  const fields: FormField[] = [];
+  for (const btn of root.querySelectorAll<HTMLElement>("button[aria-haspopup='listbox'], [role=button][aria-haspopup='listbox']")) {
+    if (btn.closest("[data-jc-ui]") || !isVisible(btn)) continue;
+    const shown = clean(btn.innerText);
+    let label = byIds(btn.getAttribute("aria-labelledby")) || containerQuestion(btn) || clean(btn.getAttribute("aria-label"));
+    // Workday's aria-label reads "Country Select One Required": keep the question only
+    label = label.replace(/\s+(select one|required)\b.*$/i, "").trim() || label;
+    if (!label) continue;
+    fields.push({
+      id: assignId([btn], btn.getAttribute(ID_ATTR)),
+      label,
+      kind: "select",
+      required: /required/i.test(btn.getAttribute("aria-label") ?? "") || btn.getAttribute("aria-required") === "true" || rawLabelHasStar(btn) || /\*/.test(containerLabel(btn)?.textContent ?? ""),
+      hasValue: !!shown && !PLACEHOLDER.test(shown),
+    });
   }
   return fields;
 }
@@ -245,7 +268,7 @@ function captureButtonGroups(root: ParentNode): FormField[] {
     seen.add(parent);
     // the row may also hold a hidden input that mirrors the choice
     const all = [...parent.children] as HTMLElement[];
-    const kids = all.filter((k) => k.tagName === "BUTTON");
+    const kids = all.filter((k) => k.tagName === "BUTTON" && !k.hasAttribute("aria-haspopup"));
     if (kids.length < 2 || kids.length > 5 || all.some((k) => k.tagName !== "BUTTON" && !(k instanceof HTMLInputElement && !isVisible(k)))) continue;
     const options = kids.map((k) => clean(k.textContent));
     if (options.some((t) => !t || t.length > 24 || NOT_CHOICES.test(t)) || !isVisible(parent)) continue;
@@ -258,7 +281,7 @@ function captureButtonGroups(root: ParentNode): FormField[] {
       kind: "radio",
       required: /\*/.test(lbl.textContent ?? "") || /required/i.test(lbl.className),
       options,
-      value: selected >= 0 ? options[selected] : "",
+      hasValue: selected >= 0,
     });
   }
   return fields;
@@ -273,7 +296,7 @@ function comboField(el: HTMLElement): FormField {
     label,
     kind: "select",
     required: isRequired(el, label, rawLabelHasStar(el)),
-    value: current,
+    hasValue: !!current,
   };
 }
 
@@ -298,17 +321,17 @@ function captureGoogleForm(): FormField[] {
 
     if (radios.length) {
       const options = radios.map(optText);
-      fields.push({ id: assignId([item], existing), label, kind: "radio", required, options, value: options[radios.findIndex((r) => r.getAttribute("aria-checked") === "true")] ?? "" });
+      fields.push({ id: assignId([item], existing), label, kind: "radio", required, options, hasValue: radios.some((r) => r.getAttribute("aria-checked") === "true") });
     } else if (checks.length) {
       const options = checks.map((c) => clean(c.getAttribute("data-answer-value") ?? c.getAttribute("aria-label")));
-      fields.push({ id: assignId([item], existing), label, kind: "checkbox", required, options, value: options.filter((_, i) => checks[i]?.getAttribute("aria-checked") === "true") });
+      fields.push({ id: assignId([item], existing), label, kind: "checkbox", required, options, hasValue: checks.some((c) => c.getAttribute("aria-checked") === "true") });
     } else if (listbox) {
       const options = [...listbox.querySelectorAll<HTMLElement>("[role=option]")].map(optText).filter((o) => o && !/^choose$/i.test(o));
       fields.push({ id: assignId([item], existing), label, kind: "select", required, options });
     } else if (textarea) {
-      fields.push({ id: assignId([item], existing), label, kind: "textarea", required, value: textarea.value });
+      fields.push({ id: assignId([item], existing), label, kind: "textarea", required, hasValue: !!textarea.value.trim() });
     } else if (input) {
-      fields.push({ id: assignId([item], existing), label, kind: "text", inputType: input.type, required, value: input.value });
+      fields.push({ id: assignId([item], existing), label, kind: "text", inputType: input.type, required, hasValue: !!input.value.trim() });
     }
   }
   return fields;
@@ -356,7 +379,7 @@ export function guessCompanyRole(site: string): { company?: string; role?: strin
 
 export function captureForm(formId: string, session = "", step = 1): CapturedForm | null {
   const site = detectSite();
-  const fields = site === "google-forms" ? captureGoogleForm() : [...captureGeneric(document), ...captureButtonGroups(document)];
+  const fields = site === "google-forms" ? captureGoogleForm() : [...captureGeneric(document), ...captureButtonGroups(document), ...captureListboxButtons(document)];
   const useful = fields.filter((f) => f.label && !/captcha|honeypot/i.test(f.label));
   if (useful.length < 2) return null;
   return {
@@ -408,6 +431,13 @@ export function findNextButton(): HTMLElement | null {
 }
 
 export const describeButton = buttonText;
+
+// The final "Submit" button (review page of a multi-step form).
+const SUBMIT_BTN_RE = /^(submit|submit application|submit my application|send application|finish)$/i;
+export function findSubmitButton(): HTMLElement | null {
+  const els = [...document.querySelectorAll<HTMLElement>(CLICKABLE)].filter((e) => !e.closest("[data-jc-ui]"));
+  return els.find((e) => SUBMIT_BTN_RE.test(buttonText(e).replace(/[›»→▸]/g, "").trim()) && visibleEnabled(e)) ?? null;
+}
 
 // Fields the page marks as invalid after trying to advance.
 export function invalidFieldLabels(): string[] {

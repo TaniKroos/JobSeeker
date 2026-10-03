@@ -1,12 +1,12 @@
-// Server-side pre-matching of form fields to the user's profile and saved answers, so Claude
-// only has to write answers for the questions that are actually new.
+// Server-side pre-matching of form fields to facts the AI assistant passes in (from its own memory of
+// the user), so Claude only writes answers for the questions that are actually new. The facts are used
+// for the one request and never stored.
 
 import type { FormField } from "@job-copilot/shared";
-import type { SavedAnswer } from "./db";
 
 export interface Suggestion {
   value: string | string[];
-  from: string; // e.g. "profile.email", "saved answer", "EEO: decline"
+  from: string; // e.g. "facts.email", "EEO: decline"
 }
 
 type Profile = Record<string, unknown>;
@@ -68,32 +68,32 @@ interface Rule {
 }
 
 const RULES: Rule[] = [
-  { test: /\bpreferred (first )?name\b|what (would you like|should we) (us to )?call you/, value: (p) => str(p.preferred_name) ?? splitName(p).first, from: "profile.preferred_name" },
-  { test: /\bfirst name\b|\bgiven name\b/, value: (p) => splitName(p).first, from: "profile.full_name" },
-  { test: /\blast name\b|\bsurname\b|\bfamily name\b/, value: (p) => splitName(p).last, from: "profile.full_name" },
-  { test: /^(full |legal |your )?name$|\bfull name\b|\blegal name\b/, value: (p) => splitName(p).full, from: "profile.full_name" },
-  { test: /\be-?mail\b/, kinds: ["text"], value: (p) => str(p.email), from: "profile.email" },
-  { test: /\bphone\b|\bmobile\b|\bcontact number\b/, kinds: ["text"], value: (p) => str(p.phone), from: "profile.phone" },
-  { test: /linkedin/, kinds: ["text"], value: (p) => str(p.linkedin), from: "profile.linkedin" },
-  { test: /github/, kinds: ["text"], value: (p) => str(p.github), from: "profile.github" },
-  { test: /portfolio|personal (web)?site|^website\b/, kinds: ["text"], value: (p) => str(p.portfolio) ?? str(p.website), from: "profile.portfolio" },
-  { test: /\b(current|previous|most recent)\b.*\b(company|employer)\b|^(current )?(company|employer)$/, kinds: ["text", "textarea"], value: (p) => str(p.current_company), from: "profile.current_company" },
-  { test: /\b(current|previous|most recent)\b.*\b(job )?title\b|\bdesignation\b|^(job )?title$/, kinds: ["text"], value: (p) => str(p.current_title), from: "profile.current_title" },
-  { test: /years of (relevant |professional |total )?experience|experience \(years\)|total experience/, value: (p) => str(p.years_experience), from: "profile.years_experience" },
-  { test: /notice period/, value: (p) => str(p.notice_period), from: "profile.notice_period" },
-  { test: /current (ctc|salary|compensation|pay)/, value: (p) => str(p.current_ctc), from: "profile.current_ctc" },
-  { test: /expected (ctc|salary|compensation)|salary expectation|desired (salary|compensation)/, value: (p) => str(p.expected_ctc), from: "profile.expected_ctc" },
-  { test: /\b(school|university|college|institution)\b/, value: (p) => str(p.college), from: "profile.college" },
-  { test: /\bdegree\b|highest (level of )?(education|qualification)/, value: (p) => str(p.degree), from: "profile.degree" },
-  { test: /graduat(ion|e|ed)\b.*\b(year|date)|year of (graduation|passing)/, value: (p) => str(p.graduation_year), from: "profile.graduation_year" },
-  { test: /\b(c?gpa|grade point|percentage)\b/, value: (p) => str(p.cgpa), from: "profile.cgpa" },
-  { test: /\b(sponsor|sponsorship)\b/, value: (p) => str(p.requires_sponsorship), from: "profile.requires_sponsorship", boolean: true },
-  { test: /authori[sz]ed to work|legally (authori[sz]ed|eligible|entitled)|right to work|eligible to work/, value: (p) => str(p.work_authorization), from: "profile.work_authorization", boolean: true },
-  { test: /relocat/, value: (p) => str(p.willing_to_relocate), from: "profile.willing_to_relocate", boolean: true },
-  { test: /\bremote\b.*\b(intend|prefer|would you)|work (from|location) preference|(remote|hybrid|on-?site|office) preference/, value: (p) => str(p.work_preference), from: "profile.work_preference", word: true },
-  { test: /\bcountry\b.*\b(reside|residence|live|located|based)\b|\bcountry of residence\b|^country$/, value: (p) => str(p.country), from: "profile.country" },
-  { test: /\b(current )?(city|location)\b(?!.*\bwilling\b)/, kinds: ["text", "select"], value: (p) => str(p.city), from: "profile.city" },
-  { test: /\bpronouns?\b/, kinds: ["text"], value: (p) => str(p.pronouns), from: "profile.pronouns" },
+  { test: /\bpreferred (first )?name\b|what (would you like|should we) (us to )?call you/, value: (p) => str(p.preferred_name) ?? splitName(p).first, from: "facts.preferred_name" },
+  { test: /\bfirst name\b|\bgiven name\b/, value: (p) => splitName(p).first, from: "facts.full_name" },
+  { test: /\blast name\b|\bsurname\b|\bfamily name\b/, value: (p) => splitName(p).last, from: "facts.full_name" },
+  { test: /^(full |legal |your )?name$|\bfull name\b|\blegal name\b/, value: (p) => splitName(p).full, from: "facts.full_name" },
+  { test: /\be-?mail\b/, kinds: ["text"], value: (p) => str(p.email), from: "facts.email" },
+  { test: /\bphone\b|\bmobile\b|\bcontact number\b/, kinds: ["text"], value: (p) => str(p.phone), from: "facts.phone" },
+  { test: /linkedin/, kinds: ["text"], value: (p) => str(p.linkedin), from: "facts.linkedin" },
+  { test: /github/, kinds: ["text"], value: (p) => str(p.github), from: "facts.github" },
+  { test: /portfolio|personal (web)?site|^website\b/, kinds: ["text"], value: (p) => str(p.portfolio) ?? str(p.website), from: "facts.portfolio" },
+  { test: /\b(current|previous|most recent)\b.*\b(company|employer)\b|^(current )?(company|employer)$/, kinds: ["text", "textarea"], value: (p) => str(p.current_company), from: "facts.current_company" },
+  { test: /\b(current|previous|most recent)\b.*\b(job )?title\b|\bdesignation\b|^(job )?title$/, kinds: ["text"], value: (p) => str(p.current_title), from: "facts.current_title" },
+  { test: /years of (relevant |professional |total )?experience|experience \(years\)|total experience/, value: (p) => str(p.years_experience), from: "facts.years_experience" },
+  { test: /notice period/, value: (p) => str(p.notice_period), from: "facts.notice_period" },
+  { test: /current (ctc|salary|compensation|pay)/, value: (p) => str(p.current_ctc), from: "facts.current_ctc" },
+  { test: /expected (ctc|salary|compensation)|salary expectation|desired (salary|compensation)/, value: (p) => str(p.expected_ctc), from: "facts.expected_ctc" },
+  { test: /\b(school|university|college|institution)\b/, value: (p) => str(p.college), from: "facts.college" },
+  { test: /\bdegree\b|highest (level of )?(education|qualification)/, value: (p) => str(p.degree), from: "facts.degree" },
+  { test: /graduat(ion|e|ed)\b.*\b(year|date)|year of (graduation|passing)/, value: (p) => str(p.graduation_year), from: "facts.graduation_year" },
+  { test: /\b(c?gpa|grade point|percentage)\b/, value: (p) => str(p.cgpa), from: "facts.cgpa" },
+  { test: /\b(sponsor|sponsorship)\b/, value: (p) => str(p.requires_sponsorship), from: "facts.requires_sponsorship", boolean: true },
+  { test: /authori[sz]ed to work|legally (authori[sz]ed|eligible|entitled)|right to work|eligible to work/, value: (p) => str(p.work_authorization), from: "facts.work_authorization", boolean: true },
+  { test: /relocat/, value: (p) => str(p.willing_to_relocate), from: "facts.willing_to_relocate", boolean: true },
+  { test: /\bremote\b.*\b(intend|prefer|would you)|work (from|location) preference|(remote|hybrid|on-?site|office) preference/, value: (p) => str(p.work_preference), from: "facts.work_preference", word: true },
+  { test: /\bcountry\b.*\b(reside|residence|live|located|based)\b|\bcountry of residence\b|^country$/, value: (p) => str(p.country), from: "facts.country" },
+  { test: /\b(current )?(city|location)\b(?!.*\bwilling\b)/, kinds: ["text", "select"], value: (p) => str(p.city), from: "facts.city" },
+  { test: /\bpronouns?\b/, kinds: ["text"], value: (p) => str(p.pronouns), from: "facts.pronouns" },
 ];
 
 const EEO = /\b(gender|sex|race|racial|ethnicity|hispanic|latino|veteran|disability|disabled|sexual orientation|transgender|lgbt)/;
@@ -115,24 +115,19 @@ function toOption(field: FormField, value: string, rule?: Rule): string | undefi
   return matchOption(options, value);
 }
 
-export function suggestFor(field: FormField, profile: Profile, saved: SavedAnswer[]): Suggestion | undefined {
-  if (field.kind === "file") return undefined;
-  const hasValue = Array.isArray(field.value) ? field.value.length > 0 : !!field.value?.trim();
-  if (hasValue) return undefined;
+export function suggestFor(field: FormField, profile: Profile): Suggestion | undefined {
+  if (field.kind === "file" || field.hasValue) return undefined;
   const label = norm(field.label);
 
   // Voluntary EEO questions: decline by default.
-  if (EEO.test(label) && field.options?.length && field.kind !== "text") {
-    const decline = field.options.find((o) => DECLINE.test(o.toLowerCase()));
-    if (decline) return { value: field.kind === "checkbox" ? [decline] : decline, from: "EEO: decline to answer" };
-  }
-
-  // An answer the user saved for this exact question.
-  const exact = saved.find((a) => norm(a.question) === label);
-  if (exact) {
-    if (field.kind === "text" || field.kind === "textarea") return { value: exact.answer, from: "saved answer" };
-    const opt = field.options?.length ? matchOption(field.options, exact.answer) : exact.answer;
-    if (opt) return { value: field.kind === "checkbox" ? [opt] : opt, from: "saved answer" };
+  if (EEO.test(label) && field.kind !== "text" && field.kind !== "textarea") {
+    if (field.options?.length) {
+      const decline = field.options.find((o) => DECLINE.test(o.toLowerCase()));
+      if (decline) return { value: field.kind === "checkbox" ? [decline] : decline, from: "EEO: decline to answer" };
+    } else if (field.kind === "select") {
+      // options only appear when the dropdown opens: the extension picks the "decline" one
+      return { value: "(decline to answer)", from: "EEO: decline to answer" };
+    }
   }
 
   for (const rule of RULES) {

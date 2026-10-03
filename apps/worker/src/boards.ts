@@ -5,7 +5,28 @@ import { htmlToText, type JobDetails, type JobSummary } from "./jobs";
 
 export type MoreAts = "workday" | "smartrecruiters" | "workable" | "recruitee";
 
-const UA = { "user-agent": "Mozilla/5.0 (compatible; JobCopilot/0.2; +https://jobs.smudgee.xyz)" };
+// What a board search hands to the shared filter/sort/page step in search.ts.
+export interface BoardPool {
+  total: number; // jobs on the board matching what the board itself filtered
+  pool: JobSummary[]; // the jobs we actually read
+  keywordsApplied: boolean; // the board already filtered by keywords
+  locationApplied: boolean; // the board already filtered by location
+  partial: boolean; // the board has more matching jobs than we read
+}
+
+// Workday only says "Posted Today", "Posted Yesterday", "Posted 3 Days Ago", "Posted 30+ Days Ago".
+export function workdayPostedAt(text: string | undefined): { at?: string; approx?: boolean } {
+  if (!text) return {};
+  const day = 86_400_000;
+  const t = text.toLowerCase();
+  if (t.includes("today")) return { at: new Date().toISOString() };
+  if (t.includes("yesterday")) return { at: new Date(Date.now() - day).toISOString() };
+  const m = /(\d+)(\+)?\s*days?/.exec(t);
+  if (m) return { at: new Date(Date.now() - Number(m[1]) * day).toISOString(), approx: !!m[2] };
+  return {};
+}
+
+const UA = { "user-agent": "Mozilla/5.0 (compatible; JobSeeker/1.0; +https://jobs.smudgee.xyz)" };
 
 async function json(url: string, init?: RequestInit): Promise<any | null> {
   try {
@@ -49,32 +70,75 @@ export function parseWorkdayUrl(u: URL): { board: string; id?: string } | null {
   return { board: `${u.hostname}/${tenant}/${site}`, id };
 }
 
-async function workdaySearch(board: string, keywords?: string, location?: string, limit = 20) {
+interface WdFacetValue {
+  descriptor?: string;
+  id?: string;
+  count?: number;
+  facetParameter?: string;
+  values?: WdFacetValue[];
+}
+
+// Location facets are nested (e.g. locationMainGroup → locations / locationHierarchy1).
+function workdayLocationFacet(facets: WdFacetValue[], location: string): { param: string; id: string } | null {
+  const want = location.toLowerCase().replace(/^bangalore\b/, "bengaluru").trim();
+  const leaves: { param: string; id: string; name: string; specific: boolean }[] = [];
+  const walk = (list: WdFacetValue[] | undefined, param: string | undefined) => {
+    for (const v of list ?? []) {
+      if (v.values) walk(v.values, v.facetParameter ?? param);
+      else if (v.id && v.descriptor && param && /location/i.test(param)) leaves.push({ param, id: v.id, name: v.descriptor.toLowerCase(), specific: param === "locations" });
+    }
+  };
+  walk(facets, undefined);
+  const words = (n: string) => n.split(/[,\s]+/).filter(Boolean);
+  const hit =
+    leaves.find((l) => l.name === want) ??
+    leaves.find((l) => l.specific && words(l.name).includes(want)) ??
+    leaves.find((l) => words(l.name).includes(want)) ??
+    leaves.find((l) => l.name.includes(want));
+  return hit ? { param: hit.param, id: hit.id } : null;
+}
+
+const WD_PAGES = 5; // 5 × 20 = 100 jobs read per search (Workday's page size is 20)
+
+async function workdaySearch(board: string, keywords?: string, location?: string): Promise<BoardPool | null> {
   const { host, tenant, site } = wdParts(board);
   const api = `https://${host}/wday/cxs/${tenant}/${site}/jobs`;
-  const text = [keywords, location].filter(Boolean).join(" ");
-  // Workday pages are 20 jobs; read a few pages so the location filter has enough to work with.
-  const pages = await Promise.all([0, 20, 40, 60].map((offset) => post(api, { appliedFacets: {}, limit: 20, offset, searchText: text })));
-  const first = pages[0];
+  const searchText = keywords ?? "";
+  const first = await post(api, { appliedFacets: {}, limit: 20, offset: 0, searchText });
   if (!first?.jobPostings) return null;
-  let jobs: JobSummary[] = pages
-    .flatMap((p) => p?.jobPostings ?? [])
-    .map((j: any) => ({
-      ats: "workday" as const,
-      board,
-      id: j.externalPath,
-      title: j.title,
-      location: j.locationsText ?? "",
-      url: wdJobUrl(board, j.externalPath),
-      applyUrl: `${wdJobUrl(board, j.externalPath)}/apply`,
-      updatedAt: j.postedOn,
-    }));
-  const loc = location?.toLowerCase().replace(/^bangalore$/, "bengaluru");
-  if (loc) {
-    const narrowed = jobs.filter((j) => j.location.toLowerCase().includes(loc) || /locations?$/i.test(j.location));
-    if (narrowed.length) jobs = narrowed;
+  let applied: Record<string, string[]> = {};
+  let locationApplied = false;
+  if (location) {
+    const facet = workdayLocationFacet(first.facets ?? [], location);
+    if (facet) {
+      applied = { [facet.param]: [facet.id] };
+      locationApplied = true;
+    }
   }
-  return { total: first.total ?? jobs.length, jobs: jobs.slice(0, limit) };
+  const firstPage = locationApplied ? await post(api, { appliedFacets: applied, limit: 20, offset: 0, searchText }) : first;
+  const total: number = firstPage?.total ?? 0;
+  const rest = await Promise.all(
+    Array.from({ length: Math.min(WD_PAGES, Math.ceil(total / 20)) - 1 }, (_, i) =>
+      post(api, { appliedFacets: applied, limit: 20, offset: (i + 1) * 20, searchText }),
+    ),
+  );
+  const pool: JobSummary[] = [firstPage, ...rest]
+    .flatMap((p) => p?.jobPostings ?? [])
+    .map((j: any) => {
+      const posted = workdayPostedAt(j.postedOn);
+      return {
+        ats: "workday" as const,
+        board,
+        id: j.externalPath,
+        title: j.title,
+        location: j.locationsText ?? "",
+        url: wdJobUrl(board, j.externalPath),
+        applyUrl: `${wdJobUrl(board, j.externalPath)}/apply`,
+        postedAt: posted.at,
+        postedApprox: posted.approx,
+      };
+    });
+  return { total, pool, keywordsApplied: true, locationApplied, partial: total > pool.length };
 }
 
 async function workdayDetails(board: string, path: string): Promise<JobDetails | null> {
@@ -98,23 +162,27 @@ async function workdayDetails(board: string, path: string): Promise<JobDetails |
 
 // ---------- SmartRecruiters ----------
 
-async function srSearch(company: string, keywords?: string, location?: string, limit = 20) {
+async function srSearch(company: string, keywords?: string): Promise<BoardPool | null> {
   const q = new URLSearchParams({ limit: "100" });
   if (keywords) q.set("q", keywords);
-  const d = await json(`https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(company)}/postings?${q}`);
-  if (!d?.content?.length) return null;
-  let jobs: JobSummary[] = d.content.map((j: any) => ({
-    ats: "smartrecruiters" as const,
-    board: company,
-    id: j.id,
-    title: j.name,
-    location: [j.location?.city, j.location?.region, j.location?.country?.toUpperCase()].filter(Boolean).join(", ") + (j.location?.remote ? " (Remote)" : ""),
-    department: j.department?.label,
-    url: `https://jobs.smartrecruiters.com/${company}/${j.id}`,
-    updatedAt: j.releasedDate,
-  }));
-  if (location) jobs = jobs.filter((j) => j.location.toLowerCase().includes(location.toLowerCase().replace(/^bangalore$/, "bengaluru")) || j.location.toLowerCase().includes(location.toLowerCase()));
-  return { total: d.totalFound ?? jobs.length, jobs: jobs.slice(0, limit) };
+  const base = `https://api.smartrecruiters.com/v1/companies/${encodeURIComponent(company)}/postings?${q}`;
+  const first = await json(base);
+  if (!first?.content?.length) return null;
+  const total: number = first.totalFound ?? first.content.length;
+  const more = total > 100 ? await Promise.all([100, 200].filter((o) => o < total).map((o) => json(`${base}&offset=${o}`))) : [];
+  const pool: JobSummary[] = [first, ...more]
+    .flatMap((d) => d?.content ?? [])
+    .map((j: any) => ({
+      ats: "smartrecruiters" as const,
+      board: company,
+      id: j.id,
+      title: j.name,
+      location: [j.location?.city, j.location?.region, j.location?.country?.toUpperCase()].filter(Boolean).join(", ") + (j.location?.remote ? " (Remote)" : ""),
+      department: j.department?.label,
+      url: `https://jobs.smartrecruiters.com/${company}/${j.id}`,
+      postedAt: j.releasedDate,
+    }));
+  return { total, pool, keywordsApplied: true, locationApplied: false, partial: total > pool.length };
 }
 
 async function srDetails(company: string, id: string): Promise<JobDetails | null> {
@@ -140,10 +208,10 @@ async function srDetails(company: string, id: string): Promise<JobDetails | null
 
 // ---------- Workable ----------
 
-async function workableSearch(account: string, keywords?: string, location?: string, limit = 20) {
+async function workableSearch(account: string, keywords?: string): Promise<BoardPool | null> {
   const d = await post(`https://apply.workable.com/api/v3/accounts/${account}/jobs`, { query: keywords ?? "", location: [], department: [], worktype: [], remote: [] });
   if (!d?.results?.length) return null;
-  let jobs: JobSummary[] = d.results.map((j: any) => ({
+  const pool: JobSummary[] = d.results.map((j: any) => ({
     ats: "workable" as const,
     board: account,
     id: j.shortcode,
@@ -152,10 +220,10 @@ async function workableSearch(account: string, keywords?: string, location?: str
     department: Array.isArray(j.department) ? j.department[0] : j.department,
     url: `https://apply.workable.com/${account}/j/${j.shortcode}/`,
     applyUrl: `https://apply.workable.com/${account}/j/${j.shortcode}/apply/`,
-    updatedAt: j.published,
+    postedAt: j.published,
   }));
-  if (location) jobs = jobs.filter((j) => j.location.toLowerCase().includes(location.toLowerCase()));
-  return { total: d.total ?? jobs.length, jobs: jobs.slice(0, limit) };
+  const total: number = d.total ?? pool.length;
+  return { total, pool, keywordsApplied: true, locationApplied: false, partial: total > pool.length };
 }
 
 async function workableDetails(account: string, code: string): Promise<JobDetails | null> {
@@ -192,18 +260,14 @@ function recruiteeSummary(slug: string, o: any): JobSummary {
     department: o.department,
     url: o.careers_url,
     applyUrl: o.careers_apply_url,
-    updatedAt: o.published_at ?? o.created_at,
+    postedAt: o.published_at ?? o.created_at,
   };
 }
 
-async function recruiteeSearch(slug: string, keywords?: string, location?: string, limit = 20) {
+async function recruiteeSearch(slug: string): Promise<BoardPool | null> {
   const offers = await recruiteeOffers(slug);
   if (!offers) return null;
-  const words = (keywords ?? "").toLowerCase().split(/\s+/).filter((w) => w.length > 1);
-  let jobs = offers.map((o) => recruiteeSummary(slug, o));
-  if (words.length) jobs = jobs.filter((j) => words.some((w) => `${j.title} ${j.department ?? ""}`.toLowerCase().includes(w)));
-  if (location) jobs = jobs.filter((j) => j.location.toLowerCase().includes(location.toLowerCase()));
-  return { total: offers.length, jobs: jobs.slice(0, limit) };
+  return { total: offers.length, pool: offers.map((o) => recruiteeSummary(slug, o)), keywordsApplied: false, locationApplied: false, partial: false };
 }
 
 async function recruiteeDetails(slug: string, id: string): Promise<JobDetails | null> {
@@ -218,16 +282,16 @@ async function recruiteeDetails(slug: string, id: string): Promise<JobDetails | 
 
 // ---------- dispatch ----------
 
-export async function searchMore(ats: MoreAts, board: string, keywords?: string, location?: string, limit = 20) {
+export async function searchMore(ats: MoreAts, board: string, keywords?: string, location?: string): Promise<BoardPool | null> {
   switch (ats) {
     case "workday":
-      return workdaySearch(board, keywords, location, limit);
+      return workdaySearch(board, keywords, location);
     case "smartrecruiters":
-      return srSearch(board, keywords, location, limit);
+      return srSearch(board, keywords);
     case "workable":
-      return workableSearch(board, keywords, location, limit);
+      return workableSearch(board, keywords);
     case "recruitee":
-      return recruiteeSearch(board, keywords, location, limit);
+      return recruiteeSearch(board);
   }
 }
 
@@ -268,15 +332,18 @@ export function parseMoreUrl(raw: string): { ats: MoreAts; board: string; id?: s
 }
 
 // Try the boards that don't need an exact URL, guessing the company's slug.
-export async function guessMore(slugs: string[], original: string, keywords?: string, location?: string, limit = 20) {
+export async function guessMore(slugs: string[], original: string, keywords?: string): Promise<{ ats: MoreAts; board: string; r: BoardPool } | null> {
   const srIds = [...new Set([original.replace(/[^A-Za-z0-9]/g, ""), ...slugs])];
-  const attempts: Promise<{ ats: MoreAts; board: string; r: Awaited<ReturnType<typeof searchMore>> }>[] = [
-    ...srIds.slice(0, 2).map(async (b) => ({ ats: "smartrecruiters" as const, board: b, r: await srSearch(b, keywords, location, limit) })),
-    ...slugs.slice(0, 2).map(async (b) => ({ ats: "workable" as const, board: b, r: await workableSearch(b, keywords, location, limit) })),
-    ...slugs.slice(0, 2).map(async (b) => ({ ats: "recruitee" as const, board: b, r: await recruiteeSearch(b, keywords, location, limit) })),
+  type Attempt = { ats: MoreAts; board: string; r: BoardPool | null };
+  const attempts: Promise<Attempt>[] = [
+    ...srIds.slice(0, 2).map(async (b): Promise<Attempt> => ({ ats: "smartrecruiters", board: b, r: await srSearch(b, keywords) })),
+    ...slugs.slice(0, 2).map(async (b): Promise<Attempt> => ({ ats: "workable", board: b, r: await workableSearch(b, keywords) })),
+    ...slugs.slice(0, 2).map(async (b): Promise<Attempt> => ({ ats: "recruitee", board: b, r: await recruiteeSearch(b) })),
   ];
-  const found = (await Promise.all(attempts.map((p) => p.catch(() => null)))).filter((x) => x?.r && x.r.total > 0);
-  return found.sort((a, b) => b!.r!.total - a!.r!.total)[0] ?? null;
+  const found = (await Promise.all(attempts.map((p) => p.catch(() => null)))).filter(
+    (x): x is { ats: MoreAts; board: string; r: BoardPool } => !!x?.r && x.r.total > 0,
+  );
+  return found.sort((a, b) => b.r.total - a.r.total)[0] ?? null;
 }
 
 // ---------- careers pages and arbitrary job pages ----------

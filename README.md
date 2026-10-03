@@ -1,21 +1,36 @@
-# Job Copilot
+# JobSeeker
 
-Find jobs, fill applications and track them from Claude (or ChatGPT). Claude writes the answers; a Chrome extension types them into the application page; you review and click Submit.
+Your AI assistant (Claude or ChatGPT) fills job applications in your browser. You review and submit. Live at **https://jobs.smudgee.xyz**.
 
 ```
 Claude / ChatGPT ──MCP──► Cloudflare Worker ◄──WebSocket── Chrome extension ──► application page
-                          • job search (Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable, Recruitee, Oracle; any job page via JSON-LD)
-                          • profile + answer bank + tracker (D1)
+                          • job search: Greenhouse, Lever, Ashby, Workday, SmartRecruiters,
+                            Workable, Recruitee, Oracle; any job page (JSON-LD)
+                          • users + a 90-day application list (D1)
                           • one room per user (Durable Object) routing fills to the right tab
 ```
 
 | Folder | What |
 |---|---|
-| `apps/worker` | Cloudflare Worker: MCP server (`/mcp`), OAuth for the connector, extension sign-in and WebSocket, D1 schema |
-| `apps/extension` | Chrome extension (WXT, Manifest V3): captures forms, fills them, detects submit |
+| `apps/worker` | Cloudflare Worker: MCP server (`/mcp`), Google sign-in for the connector and the extension, extension WebSocket, website (`/`, `/privacy`, `/terms`), daily cleanup cron |
+| `apps/extension` | Chrome extension (WXT, Manifest V3): captures forms, fills them, clicks Next on multi-page forms, detects submit |
 | `packages/shared` | Types shared by both |
+| `assets/logo.svg` | Logo source; `apps/extension/scripts/make-assets.mjs` renders the icons and social image |
+| `store-assets/`, `docs/store-listing.md` | Chrome Web Store images and listing text |
+| `plan.md` | Decisions and roadmap |
 
 Requires **Node 22+** (`nvm use`).
+
+## Data we keep (on purpose, very little)
+
+| Data | Retention |
+|---|---|
+| `users`: email, Google account ID | until the user asks for deletion |
+| `applications`: company, role, URL, status, applied date | 90 days after last update (daily cron + filtered on read) |
+| extension sign-in (hashed token) | 90 days |
+| open form questions in the user's room (labels/options/answered?, never typed values) | 1 hour (Durable Object alarm) |
+
+No profile and no saved answers: facts about the user live in the assistant's memory and are passed as `facts` with `get_open_forms` / `fill_form`, used for that request only. `delete_my_data` erases the tracker and extension sign-ins.
 
 ## Run locally
 
@@ -23,75 +38,63 @@ Requires **Node 22+** (`nvm use`).
 npm install
 cd apps/worker
 npm run db:migrate:local
-npm run dev                      # http://localhost:8787, uses .dev.vars (DEV_PASSCODE=letmein)
+npm run dev                      # http://localhost:8787 (.dev.vars: DEV_PASSCODE=letmein, Google keys)
 ```
-
-In another terminal:
 
 ```sh
-npm run build -w apps/extension  # → apps/extension/.output/chrome-mv3
+npm run build -w apps/extension  # dev build → apps/extension/.output/chrome-mv3
 ```
 
-Load the extension: `chrome://extensions` → Developer mode → **Load unpacked** → `apps/extension/.output/chrome-mv3`. Click the extension icon → **Connect** → sign in with any email + passcode `letmein`.
+Load it at `chrome://extensions` → Developer mode → **Load unpacked**. The dev build's popup has "Developer settings" to point it at `http://localhost:8787`.
 
-### Tests
+### Tests (with `npm run dev` running)
 
 ```sh
-cd apps/worker && npm run e2e                        # OAuth, extension login, every tool and board, suggestions, multi-page, user isolation
-cd apps/extension && node scripts/browser-test.mjs   # real Chromium + extension on live Greenhouse/Lever/Ashby pages (never submits) + submit detection
-cd apps/extension && node scripts/flow-test.mjs      # multi-page advance, blocked Next, job page → Apply, "any website" mode (fake pages)
+cd apps/worker && npm run e2e                        # sign-in, ticketed WebSocket, every tool and job board, recency/paging,
+                                                      # facts suggestions, multi-page advance, 90-day expiry, isolation, delete
+cd apps/extension && node scripts/flow-test.mjs      # real Chromium + extension: 2- and 5-page Workday-style flows (auto Next,
+                                                      # blocked by résumé then auto-continue, Review page), job page → Apply, any-site mode
+cd apps/extension && node scripts/browser-test.mjs   # live Greenhouse/Lever/Ashby forms (never submits) + submit detection
+node scripts/make-screenshots.mjs                     # website + store screenshots from a demo application
 ```
 
-Both need `npm run dev` running in `apps/worker`.
-
-## Deploy (Cloudflare free plan)
+## Deploy
 
 ```sh
 cd apps/worker
-npx wrangler login
-npx wrangler deploy                              # creates the KV namespace and D1 database on first deploy
+npx wrangler deploy               # Worker + static files (public/) + daily cron
 npm run db:migrate:remote
-npx wrangler secret put SESSION_SECRET           # any long random string: openssl rand -base64 32
-npx wrangler secret put DEV_PASSCODE             # optional: passcode sign-in for testing (set DEV_EMAILS in wrangler.jsonc to lock it to your email)
 ```
 
-Your server is `https://job-copilot.<your-subdomain>.workers.dev`.
+Secrets: `SESSION_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (`npx wrangler secret put …`). Production has no `DEV_PASSCODE`, so only Google sign-in is offered. Vars in `wrangler.jsonc`: `PUBLIC_URL` (empty = own origin), `EXTENSION_IDS` (lock sign-in to the store extension), `CHROME_STORE_URL` (home page "Add to Chrome").
 
-- **Claude:** Settings → Connectors → Add custom connector → `https://job-copilot.<your-subdomain>.workers.dev/mcp`
-- **ChatGPT:** Settings → Apps & Connectors → Developer mode → add the same URL
-- **Extension:** popup → Settings → Server URL → your workers.dev URL → Save → Connect
+Google OAuth client (Web): redirect URIs `https://jobs.smudgee.xyz/auth/google/callback` and `/ext/google/callback` (+ the same on `http://localhost:8787`); scopes `openid email`.
 
-### Google sign-in (for other users)
+## Chrome Web Store
 
-1. Google Cloud Console → new project → **APIs & Services → OAuth consent screen**: External, scopes `openid`, `email`, `profile` only (non-sensitive, no security review).
-2. **Credentials → Create OAuth client → Web application**, authorized redirect URIs:
-   - `https://<your-worker>/auth/google/callback` (Claude/ChatGPT connector)
-   - `https://<your-worker>/ext/google/callback` (extension)
-   - same two with `http://localhost:8787` for local dev
-3. `npx wrangler secret put GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` (locally: `.dev.vars`).
-4. Remove `DEV_PASSCODE` once Google works.
+```sh
+npm run zip:store -w apps/extension   # → apps/extension/.output/jobseeker-1.0.0-chromestore.zip
+```
+
+The store build only talks to `jobs.smudgee.xyz` and has no optional all-sites permission. Listing text, permission justifications and privacy answers: [docs/store-listing.md](docs/store-listing.md).
 
 ## MCP tools
 
-`search_jobs`, `get_job`, `get_profile`, `update_profile`, `find_saved_answers`, `save_answer`, `delete_saved_answer`, `get_open_forms`, `fill_form`, `wait_for_next_page`, `track_application`, `update_application`, `list_applications`, `delete_application`, `export_applications` (CSV; Claude can save it to Google Drive with its own Drive connector), `delete_my_data`.
+`search_jobs` (newest first, `posted_within_days` default 30, `offset` paging), `get_job` (any job URL), `get_open_forms`, `fill_form` (fills `suggested` values from `facts`; clicks Next on multi-step sites by default, never Submit), `wait_for_next_page`, `track_application`, `update_application`, `list_applications`, `delete_application`, `export_applications` (CSV), `delete_my_data`.
 
-**Finding a company's jobs:** no company is hardcoded. `search_jobs` takes a name (guesses Greenhouse/Lever/Ashby/SmartRecruiters/Workable/Recruitee slugs, then tries `example.com/careers`-style pages) or any URL: a careers page (the board it embeds or links to is detected), a board, or a single job posting. When a name isn't enough it tells Claude what to web-search for.
+No company is hardcoded: `search_jobs` guesses board slugs from a name, tries `example.com/careers`-style pages, detects the board behind any careers page or single job URL, and otherwise tells the assistant what to web-search for.
 
 ## How filling works
 
-1. On a supported site (Greenhouse, Lever, Ashby, Workday, Google Forms, or any page after **Use on this page**) the content script reads every field (label, kind, options, required) and tags it with `data-jc-id`.
-2. The background worker sends the form to the user's room over a WebSocket. It only connects while an application page is open, and pings every 20s.
-3. Claude calls `get_open_forms` → `fill_form`. Fields the server can answer from the profile/saved answers come with a `suggested` value and are filled automatically, so Claude only writes the new answers. The room forwards the answers to the browser that owns the form; the content script fills each field like a user would (native value setter, key events, clicking options) and highlights it yellow, or red if it needs you.
-4. Dropdowns and autocompletes match exactly or at a word boundary only. When nothing matches, the result lists the real options so Claude can retry with an exact one.
-5. Multi-step forms: `fill_form` with `advance: true` clicks Next/Continue (never Submit) and returns the next page in the same call; if the page refuses (validation), the response says which fields. If the user clicks Next themselves, `wait_for_next_page` returns the new page.
-6. On a job description page the pill offers **Open application**, and Claude is told the user still has to click Apply.
-7. When you submit and a thank-you page appears, the application is marked **Applied** and long answers are saved to your answer bank.
+1. On a supported site (or after **Use on this page**) the content script reads every field (label, kind, options, required, answered or not) and tags it with `data-jc-id`. Workday listbox buttons and searchable prompts are supported.
+2. The background worker trades its token for a 60-second ticket and opens a WebSocket to the user's room (only while a job page is open; ping every 20 s).
+3. `get_open_forms` returns the fields with `suggested` values matched from `facts` (and "decline" for voluntary EEO questions). `fill_form` sends them plus the assistant's answers; the extension fills like a user (native setters, key events, clicking options), highlighting fields yellow, or red if they need the user.
+4. Multi-step sites (Workday, Oracle, SuccessFactors, Taleo, iCIMS): after a clean fill the extension clicks Next/Continue and the response includes the next page. If required fields block it (e.g. résumé upload), the pill shows what's needed and the extension continues by itself once they're done. The Review page is reported as final; nothing is ever submitted.
+5. Job description pages: the pill offers **Open application**, and the assistant is told the user still has to click Apply.
+6. When a thank-you page follows Submit, the application is marked **Applied**.
 
 ## Known gaps
 
-- **Resume upload is manual.** Browsers don't let extensions attach local files.
-- **Google Forms, Workday, Oracle, iCIMS, Taleo** forms are captured with the generic reader but haven't been tested on live forms past the first page; their custom widgets may need work.
-- Naukri and LinkedIn job search aren't supported (don't scrape them).
-- "Work on every career site" (popup) asks Chrome for access to all sites; the Chrome Web Store reviews that permission more strictly.
-- The answer bank uses keyword search, not semantic search.
-- The extension has no icon yet.
+- Résumé upload is manual (browsers don't let extensions attach local files).
+- Workday and Oracle flows are tested on realistic fakes and on Workday's first pages; complex widgets on some tenants (date pickers, multi-level prompts) may still need work.
+- Naukri and LinkedIn aren't supported (don't scrape them).

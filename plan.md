@@ -1,5 +1,23 @@
 # Plan
 
+## Status (3 Oct 2026)
+Everything below is **implemented, tested and deployed** to https://jobs.smudgee.xyz, except the items marked ⏳:
+- ✅ Newest-first job search with `posted_within_days` (default 30), `offset` paging, Workday location filtering on Workday's side, deeper SmartRecruiters reads.
+- ✅ Multi-page fix: Next is clicked automatically on multi-step sites (no need for the assistant to ask), hints for stale tool lists, server logs for every fill, Workday widgets (listbox buttons, searchable prompts, "decline" on dropdowns that only show options when opened), auto-continue after the user fixes blocking fields, Review page reported as final. Tested on a 5-page Workday-style flow.
+- ✅ Minimal data: profiles and answers tables dropped, applications trimmed to company/role/URL/status/applied date with 90-day retention (daily cron), no typed values sent, 1-hour room data, ticketed WebSocket (no token in URLs), `facts` from the assistant's memory used per request only, Google scopes `openid email`, dev passcode removed in production.
+- ✅ Renamed to JobSeeker; logo, icons, social image.
+- ✅ New home page, privacy policy, terms, sign-in windows (Google button, loading/error states, light/dark).
+- ✅ Store build (`npm run zip:store -w apps/extension`), version 1.0.0, screenshots and promo tile in `store-assets/`, listing text in `docs/store-listing.md`.
+- ⏳ Owner: create the Chrome Web Store developer account and submit (see "Publishing steps"); update the Google consent screen's app name to JobSeeker.
+- ⏳ After approval: set `EXTENSION_IDS` and `CHROME_STORE_URL`, redeploy.
+- ⏳ Live test of a full Workday / Oracle application past the first page (needs a real account on those sites).
+
+## Decisions (3 Oct 2026)
+- **Product name: JobSeeker** (replaces "Job Copilot" everywhere: extension, connector/MCP server name, website, Google consent screen, store listing). Before building icons and the listing, check the name for conflicts: Australia's government "JobSeeker Payment" and existing apps called JobSeeker; it may need a distinguishing tagline or variant in the store.
+- **Support / contact email:** tanishsaini26@gmail.com (shown on /privacy, /terms, the home page and the store listing; set as `CONTACT_EMAIL`).
+- **Governing law:** India, courts of Delhi.
+- **Data:** keep as little as possible (see "Keep as little user data as possible").
+
 ## Job search: newest jobs first, filtered on the server
 
 **Problem:** `search_jobs` returns at most 50 jobs (20 by default) and doesn't sort by date. Some boards are only read partly (Workday: first 80 results). Old postings can fill the results while newer ones never reach Claude.
@@ -95,7 +113,7 @@ Server-side suggestions currently come from the stored profile. Instead, `get_op
 1. **Icons:** add 16, 32, 48 and 128 px icons (the store requires 128×128) in `apps/extension/public/icon/`, wired into the manifest.
 2. **Store-only build:** host permissions only for `https://jobs.smudgee.xyz/*` plus the job sites. Drop `http://localhost/*` and `https://*.workers.dev/*`, keeping them in dev builds only. Reviewers flag permissions the extension doesn't need.
 3. **Leave out the all-sites permission** (`optional_host_permissions: <all_urls>` and the "Work on every career site" toggle) for the first submission. It triggers a slower, in-depth review; add it back in an update.
-4. **Name:** "Copilot" is a Microsoft trademark and risks rejection or a later takedown. Choose a new name (e.g. "JobsPilot") before making icons and listing assets; update the extension, connector, website and Google consent screen together.
+4. **Name → "JobSeeker"** (see Decisions). "Copilot" is a Microsoft trademark and risks rejection or a later takedown. Rename before making icons and listing assets; update the extension, connector, website and Google consent screen together.
 5. **Version** `1.0.0`; production default server `https://jobs.smudgee.xyz` (already set via `.env`).
 6. **Zip:** `npm run zip -w apps/extension` → `.output/*-chrome.zip`.
 7. **Listing assets:** at least one 1280×800 screenshot (a filled application with the pill; the popup), a 440×280 small promo tile, and a short and full description.
@@ -139,10 +157,10 @@ Server-side suggestions currently come from the stored profile. Instead, `get_op
 - The user is responsible for everything submitted; AI answers can be wrong, so always review.
 - Acceptable use: no false information, no applying for others without permission, respect job sites' terms, no abuse or automation at scale.
 - No guarantee of interviews or jobs; third-party job sites and AI assistants aren't ours.
-- Suspension, changes to the service, limitation of liability, governing law (India; **owner to confirm the city/state for jurisdiction**), and contact.
+- Suspension, changes to the service, limitation of liability, governing law (India, courts of **Delhi**), and contact (tanishsaini26@gmail.com).
 
 ### Sign-in window (the page that opens when connecting Claude or the extension)
-- New name and logo at the top. Clear title: "Connect JobsPilot to Claude" / "Connect the Chrome extension".
+- New name and logo at the top. Clear title: "Connect JobSeeker to Claude" / "Connect the Chrome extension".
 - Show **which app is asking** (client name, verified domain) and **what it can do**, as a plain list (search jobs, read and fill application forms in your browser, keep your application list), plus a link to the privacy policy.
 - **Google button per Google's branding guidelines** (official "G" mark, "Continue with Google", standard colours), as the only option. **Remove the dev passcode form in production** (keep it local-only).
 - Loading state after clicking (so people don't double-click), friendly error pages with a **Try again** button instead of plain text, and a "Connected, you can close this window" success state for the extension window.

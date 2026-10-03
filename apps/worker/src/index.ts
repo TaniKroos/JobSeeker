@@ -1,6 +1,7 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
 import app from "./app";
+import { purgeExpired } from "./db";
 import { createServer } from "./mcp";
 
 export { UserRoom } from "./room";
@@ -33,5 +34,10 @@ export default {
   fetch(request, env, ctx) {
     const base = (env.PUBLIC_URL || new URL(request.url).origin).replace(/\/$/, "");
     return getProvider({ ...env, PUBLIC_URL: base }, base).fetch(request, { ...env, PUBLIC_URL: base }, ctx);
+  },
+  // Daily: delete applications older than 90 days and expired extension sign-ins.
+  async scheduled(_event, env) {
+    const removed = await purgeExpired(env.DB);
+    console.log(JSON.stringify({ evt: "purge", ...removed }));
   },
 } satisfies ExportedHandler<Env>;

@@ -38,6 +38,15 @@ function bestMatch<T>(items: T[], text: (t: T) => string, wanted: string): T | u
   );
 }
 
+// "(decline to answer)" from the server: pick whichever option means that on this site.
+export const DECLINE_TOKEN = "(decline to answer)";
+const DECLINE_RE = /decline|prefer not|don.t wish|do not wish|not to (say|answer|disclose|self.identify)|choose not|rather not/i;
+
+function pickOption<T>(items: T[], text: (t: T) => string, wanted: string): T | undefined {
+  if (norm(wanted) === norm(DECLINE_TOKEN)) return items.find((i) => DECLINE_RE.test(text(i)));
+  return bestMatch(items, text, wanted);
+}
+
 // React/Vue track input values through the native setter; assigning .value directly is ignored.
 function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
   const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -98,7 +107,7 @@ async function fillGeneric(field: FormField, value: string | string[]): Promise<
   if (field.kind === "file") return { ok: false, note: "Upload this file yourself", el };
 
   if (el instanceof HTMLSelectElement) {
-    const opt = bestMatch([...el.options], (o) => o.text, v) ?? [...el.options].find((o) => norm(o.value) === norm(v));
+    const opt = pickOption([...el.options], (o) => o.text, v) ?? [...el.options].find((o) => norm(o.value) === norm(v));
     if (!opt) return { ok: false, note: `No option matching "${v}"`, el };
     el.value = opt.value;
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -108,8 +117,10 @@ async function fillGeneric(field: FormField, value: string | string[]): Promise<
 
   if (el.getAttribute("role") === "combobox") return fillCombobox(el, v);
 
+  if (el.getAttribute("aria-haspopup") === "listbox") return fillListboxButton(el, v);
+
   if (el instanceof HTMLButtonElement) {
-    const hit = bestMatch(els, (b) => b.textContent ?? "", v);
+    const hit = pickOption(els, (b) => b.textContent ?? "", v);
     if (!hit) return { ok: false, note: `No option matching "${v}"`, el: el.parentElement };
     realClick(hit);
     return { ok: true, el: el.parentElement };
@@ -120,7 +131,7 @@ async function fillGeneric(field: FormField, value: string | string[]): Promise<
     const wanted = Array.isArray(value) ? value : [value];
     const first = wanted[0] ?? "";
     if (el.type === "radio") {
-      const target = bestMatch(inputs, labelFor, first);
+      const target = pickOption(inputs, labelFor, first);
       if (!target) return { ok: false, note: `No option matching "${first}"`, el };
       if (!target.checked) realClick(target);
       return { ok: true, el: target.closest("fieldset") ?? target.parentElement };
@@ -182,20 +193,27 @@ function nudgeKeys(input: HTMLElement) {
 const listOf = (opts: HTMLElement[]) => opts.map((o) => (o.textContent ?? "").trim()).slice(0, 15).join(" | ");
 
 // Autocomplete text inputs (locations, schools): typing shows suggestions; pick the matching one.
-const SUGGESTION = "[role=option], .dropdown-results > *, .pac-item, li[class*='option' i], li[class*='suggestion' i], [class*='suggestion' i] li";
+const SUGGESTION =
+  "[role=option], [data-automation-id='promptOption'], [data-automation-id='promptLeafNode'], .dropdown-results > *, .pac-item, li[class*='option' i], li[class*='suggestion' i], [class*='suggestion' i] li";
+const PROMPT_OPTION = "[data-automation-id='promptOption'], [data-automation-id='promptLeafNode'], [role=option]";
+const isPromptInput = (input: HTMLElement) => !!input.closest("[data-automation-id*='multiselect' i], [data-uxi-widget-type='selectinput']");
 
 async function pickSuggestion(input: HTMLInputElement, v: string): Promise<Outcome | null> {
-  const autocomplete = input.getAttribute("aria-autocomplete") || input.getAttribute("list") || input.getAttribute("aria-controls") || /location|autocomplete|typeahead/i.test(`${input.className} ${input.name}`);
+  const prompt = isPromptInput(input);
+  const autocomplete = prompt || input.getAttribute("aria-autocomplete") || input.getAttribute("list") || input.getAttribute("aria-controls") || /location|autocomplete|typeahead/i.test(`${input.className} ${input.name}`);
   if (!autocomplete) return null;
   // some sites validate on blur and clear unselected text; put it back, then "type"
   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, v);
   nudgeKeys(input);
+  // Workday's searchable prompts search on Enter
+  if (prompt) for (const type of ["keydown", "keyup"]) input.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true } as KeyboardEventInit));
   let last: HTMLElement[] = [];
   let stable = 0;
   const end = Date.now() + 3000; // suggestions usually come from the network
   while (Date.now() < end) {
     await sleep(100);
-    const options = suggestionsFor(input, SUGGESTION);
+    // Workday renders prompt options at the end of <body>, far from the input
+    const options = prompt ? [...document.querySelectorAll<HTMLElement>(PROMPT_OPTION)].filter(visibleText) : suggestionsFor(input, SUGGESTION);
     if (!options.length) continue;
     stable = listOf(options) === listOf(last) ? stable + 1 : 0;
     last = options;
@@ -208,9 +226,30 @@ async function pickSuggestion(input: HTMLInputElement, v: string): Promise<Outco
     }
     if (stable >= 5) break; // list settled without a match
   }
-  if (!last.length) return null;
+  if (!last.length) return prompt ? { ok: false, el: input, note: `Typed "${v}" but no options appeared to pick from` } : null;
   setNativeValue(input, "");
   return { ok: false, el: input, note: `No suggestion matching "${v}". Suggestions: ${listOf(last)}` };
+}
+
+// A button that opens a listbox (Workday "Select One"): open it, pick the option.
+async function fillListboxButton(btn: HTMLElement, v: string): Promise<Outcome> {
+  realClick(btn);
+  const options = await poll(() => {
+    const listId = btn.getAttribute("aria-controls") ?? btn.getAttribute("aria-owns");
+    const scope = (listId && document.getElementById(listId)) || document;
+    const o = [...scope.querySelectorAll<HTMLElement>("[role=listbox] [role=option], [role=option]")].filter(visibleText);
+    return o.length ? o : null;
+  }, 1500);
+  if (!options) return { ok: false, note: "The dropdown didn't open", el: btn };
+  const hit = pickOption(options, (o) => o.textContent ?? "", v);
+  if (!hit) {
+    btn.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return { ok: false, note: `No option matching "${v}". Options: ${listOf(options)}`, el: btn };
+  }
+  const chosen = (hit.textContent ?? "").trim();
+  realClick(hit);
+  await sleep(60);
+  return { ok: true, el: btn, note: norm(chosen) === norm(v) ? undefined : `Selected "${chosen}"` };
 }
 
 // Custom dropdown: type to filter, then click the matching option.
@@ -220,7 +259,7 @@ async function fillCombobox(input: HTMLElement, v: string): Promise<Outcome> {
   realClick((container.querySelector("[class*='control' i]") as HTMLElement) ?? input);
   let seen = (await poll(() => { const o = suggestionsFor(input, "[role=option]", container); return o.length ? o : null; }, 400, 40)) ?? [];
   // fast path: the option is already in the open list
-  const direct = bestMatch(seen, (o) => o.textContent ?? "", v);
+  const direct = pickOption(seen, (o) => o.textContent ?? "", v);
   if (direct) {
     const chosen = (direct.textContent ?? "").trim();
     realClick(direct);
@@ -240,7 +279,7 @@ async function fillCombobox(input: HTMLElement, v: string): Promise<Outcome> {
     stable = options.length && listOf(options) === listOf(seen) ? stable + 1 : 0;
     if (options.length) seen = options;
     if (stable >= 4) break;
-    const hit = bestMatch(options, (o) => o.textContent ?? "", v);
+    const hit = pickOption(options, (o) => o.textContent ?? "", v);
     if (hit) {
       const chosen = (hit.textContent ?? "").trim();
       realClick(hit);
@@ -261,7 +300,7 @@ async function fillGoogle(field: FormField, value: string | string[]): Promise<O
   const optText = (o: HTMLElement) => o.getAttribute("data-value") ?? o.getAttribute("data-answer-value") ?? o.getAttribute("aria-label") ?? o.textContent ?? "";
 
   if (field.kind === "radio") {
-    const hit = bestMatch([...item.querySelectorAll<HTMLElement>("[role=radio]")], optText, first);
+    const hit = pickOption([...item.querySelectorAll<HTMLElement>("[role=radio]")], optText, first);
     if (!hit) return { ok: false, note: `No option matching "${first}"`, el: item };
     if (hit.getAttribute("aria-checked") !== "true") realClick(hit);
     return { ok: true, el: item };
@@ -282,7 +321,7 @@ async function fillGoogle(field: FormField, value: string | string[]): Promise<O
     realClick(listbox);
     const hit = await poll(() => {
       const opts = [...document.querySelectorAll<HTMLElement>("[role=option]")].filter((o) => item.contains(o) || o.closest("[role=presentation]"));
-      return bestMatch(opts, optText, first);
+      return pickOption(opts, optText, first);
     }, 1500);
     if (hit) {
       realClick(hit);
@@ -333,8 +372,7 @@ export async function fillForm(
   const answered = new Set(answers.map((a) => a.fieldId));
   for (const f of fields) {
     if (answered.has(f.id) || !f.required) continue;
-    const hasValue = Array.isArray(f.value) ? f.value.length > 0 : !!f.value?.trim();
-    if (hasValue) continue;
+    if (f.hasValue) continue;
     const el = document.querySelector(`[${ID_ATTR}="${CSS.escape(f.id)}"]`);
     mark(f.kind === "file" ? el?.parentElement : el, "jc-needs");
     if (!firstNeeds) firstNeeds = el;

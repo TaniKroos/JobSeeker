@@ -5,3 +5,5 @@ node_modules
 .wxt
 worker-configuration.d.ts
 oc.md
+plan.md
+docs/

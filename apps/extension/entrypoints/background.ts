@@ -136,11 +136,23 @@ export default defineBackground(() => {
     const { token, server } = await auth();
     if (!token) return;
 
-    const sock = new WebSocket(`${server.replace(/^http/, "ws")}/ext/ws?token=${encodeURIComponent(token)}`);
+    // Trade the token (sent in a header) for a 60-second ticket; only the ticket goes in the URL.
+    const res = await fetch(`${server}/ext/ws-ticket`, { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+    if (res?.status === 401) {
+      await browser.storage.local.remove(["token", "email"]);
+      broadcastStatus();
+      return;
+    }
+    const ticket = res?.ok ? ((await res.json()) as { ticket?: string }).ticket : undefined;
+    if (!ticket) {
+      setTimeout(ensureSocket, retryMs);
+      retryMs = Math.min(retryMs * 2, 30_000);
+      return;
+    }
+    if (ws && ws.readyState <= WebSocket.OPEN) return; // another call connected meanwhile
+    const sock = new WebSocket(`${server.replace(/^http/, "ws")}/ext/ws?ticket=${encodeURIComponent(ticket)}`);
     ws = sock;
-    let opened = false;
     sock.onopen = () => {
-      opened = true;
       retryMs = 1000;
       for (const e of forms.values()) sock.send(JSON.stringify({ type: "form", form: e.form } satisfies ExtToServer));
       while (outbox.length) sock.send(JSON.stringify(outbox.shift()));
@@ -158,15 +170,6 @@ export default defineBackground(() => {
       ws = null;
       clearInterval(pingTimer);
       broadcastStatus();
-      if (!opened) {
-        // handshake refused: token revoked or expired?
-        const me = await fetch(`${server}/ext/me`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
-        if (me?.status === 401) {
-          await browser.storage.local.remove(["token", "email"]);
-          broadcastStatus();
-          return;
-        }
-      }
       setTimeout(ensureSocket, retryMs);
       retryMs = Math.min(retryMs * 2, 30_000);
     };
@@ -211,7 +214,7 @@ export default defineBackground(() => {
     if (!s || Date.now() - s.at > SUBMIT_WINDOW_MS || (formId && s.formId !== formId)) return;
     submits.delete(tabId);
     persist();
-    wsSend({ type: "submitted", formId: s.formId, url: s.url, company: s.company, role: s.role, answers: s.answers });
+    wsSend({ type: "submitted", formId: s.formId, url: s.url, company: s.company, role: s.role });
   }
 
   // ---------- messages ----------

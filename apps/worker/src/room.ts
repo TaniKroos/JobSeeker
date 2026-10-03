@@ -5,10 +5,11 @@
 import { DurableObject } from "cloudflare:workers";
 import type { AdvanceResult, CapturedForm, ExtToServer, FillAnswer, FillResult, PageInfo, ServerToExt } from "@job-copilot/shared";
 import { PING, PONG } from "@job-copilot/shared";
-import { saveAnswer, upsertApplication, type User } from "./db";
+import { upsertApplication, type User } from "./db";
 
-const FORM_TTL_MS = 6 * 60 * 60 * 1000;
-const PAGE_TTL_MS = 2 * 60 * 60 * 1000;
+// Open forms and job pages are only needed while the user is applying.
+const FORM_TTL_MS = 60 * 60 * 1000;
+const PAGE_TTL_MS = 60 * 60 * 1000;
 const FILL_TIMEOUT_MS = 50_000; // long forms with many dropdowns take a while
 const NEXT_PAGE_AFTER_ADVANCE_MS = 20_000;
 
@@ -76,6 +77,7 @@ export class UserRoom extends DurableObject<Env> {
         break;
       case "page":
         await this.ctx.storage.put(`page:${msg.page.session}`, msg.page);
+        await this.scheduleCleanup();
         break;
       case "page_closed":
         await this.ctx.storage.delete(`page:${msg.session}`);
@@ -124,12 +126,13 @@ export class UserRoom extends DurableObject<Env> {
       for (const [key, other] of all) {
         if (other.form.session === form.session && other.form.formId !== form.formId) {
           await this.ctx.storage.delete(key);
-          await this.ctx.storage.put(`moved:${other.form.formId}`, form.formId); // for waitForNext on the old id
+          await this.ctx.storage.put(`moved:${other.form.formId}`, { to: form.formId, at: Date.now() }); // for waitForNext on the old id
         }
       }
       await this.ctx.storage.delete(`page:${form.session}`);
     }
     await this.ctx.storage.put(`form:${form.formId}`, rec);
+    await this.scheduleCleanup();
     for (const w of this.nextWaiters) {
       if (w.session === form.session && (form.formId !== w.afterFormId || form.step > w.afterStep)) {
         this.nextWaiters.delete(w);
@@ -147,12 +150,29 @@ export class UserRoom extends DurableObject<Env> {
     if (company && role) {
       await upsertApplication(this.env.DB, user.id, { company, role, url: msg.url, status: "Applied" });
     }
-    for (const a of (msg.answers ?? []).slice(0, 20)) {
-      if (a.question.trim() && a.answer.trim().length >= 40) {
-        await saveAnswer(this.env.DB, user.id, a.question, a.answer.trim(), "submitted");
-      }
-    }
     await this.ctx.storage.delete(`form:${msg.formId}`);
+  }
+
+  // ---------- cleanup ----------
+
+  // Wipe everything that has expired an hour after the last activity, even if no one calls us again.
+  private async scheduleCleanup() {
+    const at = Date.now() + FORM_TTL_MS + 60_000;
+    const current = await this.ctx.storage.getAlarm();
+    if (!current || current < at - 5 * 60_000) await this.ctx.storage.setAlarm(at);
+  }
+
+  async alarm(): Promise<void> {
+    const cutoff = Date.now() - FORM_TTL_MS;
+    const all = await this.ctx.storage.list<{ updatedAt?: number; seenAt?: number; at?: number }>();
+    const expired: string[] = [];
+    for (const [key, v] of all) {
+      if (key === "user") continue;
+      const t = v?.updatedAt ?? v?.seenAt ?? v?.at ?? 0;
+      if (t < cutoff) expired.push(key);
+    }
+    for (let i = 0; i < expired.length; i += 128) await this.ctx.storage.delete(expired.slice(i, i + 128));
+    if (expired.length < all.size - 1) await this.scheduleCleanup(); // something is still live
   }
 
   // ---------- called by MCP tools (RPC) ----------
@@ -194,7 +214,7 @@ export class UserRoom extends DurableObject<Env> {
       // the page already moved on: follow the chain to the page that replaced it
       let id: string | undefined = formId;
       for (let i = 0; i < 20 && id; i++) {
-        id = await this.ctx.storage.get<string>(`moved:${id}`);
+        id = (await this.ctx.storage.get<{ to: string }>(`moved:${id}`))?.to;
         const current = id ? await this.getForm(id) : null;
         if (current) return current;
       }

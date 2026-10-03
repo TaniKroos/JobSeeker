@@ -9,6 +9,7 @@ import {
   detectSite,
   findApplyTarget,
   findNextButton,
+  findSubmitButton,
   formControlCount,
   formSignature,
   guessCompanyRole,
@@ -28,7 +29,7 @@ export type ContentMsg =
   | { type: "page"; page: PageInfo }
   | { type: "page_closed"; session: string }
   | { type: "advance_blocked"; formId: string; note: string }
-  | { type: "submit_attempt"; formId: string; url: string; company?: string; role?: string; answers: { question: string; answer: string }[] }
+  | { type: "submit_attempt"; formId: string; url: string; company?: string; role?: string }
   | { type: "submit_confirmed"; formId: string }
   | { type: "success_page" }
   | { type: "status?" }
@@ -76,9 +77,9 @@ function saveSession(s: SessionState) {
 // mode: "site" = known job site; "manual" = user clicked "Use on this page"; "lazy" = any site
 // (only wakes up once the page has a form or a job posting).
 export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
-  const w = window as unknown as { __jobCopilot?: boolean };
-  if (w.__jobCopilot) return;
-  w.__jobCopilot = true;
+  const w = window as unknown as { __jobSeeker?: boolean };
+  if (w.__jobSeeker) return;
+  w.__jobSeeker = true;
 
   const isTop = window.top === window;
   let formId = crypto.randomUUID();
@@ -117,15 +118,16 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
   function render() {
     if (!current) return;
     const p = getPill();
-    if (!status.signedIn) return p.show("Job Copilot isn't connected", "warn", { action: connectAction });
+    if (!status.signedIn) return p.show("JobSeeker isn't connected", "warn", { action: connectAction });
     if (filling) return;
+    if (current.final) return p.show("Final page · review everything, then click Submit", "done");
     if (lastFill) {
       return lastFill.needs
-        ? p.show(`Filled ${lastFill.filled} · ${lastFill.needs} need you · review, then submit`, "done", { action: { label: "Next field ›", onClick: jumpToNeeds } })
+        ? p.show(`Filled ${lastFill.filled} · ${lastFill.needs} ${lastFill.needs === 1 ? "needs" : "need"} you · review, then submit`, "done", { action: { label: "Next field ›", onClick: jumpToNeeds } })
         : p.show(`Filled ${lastFill.filled} · review, then submit`, "done");
     }
     const step = current.step > 1 ? `Page ${current.step} · ` : "";
-    p.show(`${step}${current.fields.length} fields ready · ask Claude to "fill it"`, "ready");
+    p.show(`${step}${current.fields.length} fields ready · ask your AI to “fill it”`, "ready");
   }
 
   // ---------- capture ----------
@@ -143,9 +145,14 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
     const site = detectSite();
     const meta = guessCompanyRole(site);
     const s = session(meta);
-    const form = captureForm(formId, s.id, s.step || 1);
+    let form = captureForm(formId, s.id, s.step || 1);
+    // The review page of a multi-step application: no fields, just Submit. Report it so the
+    // assistant knows to stop and hand over to the user.
+    if (!form && s.step > 0 && findSubmitButton()) {
+      form = { formId, session: s.id, step: s.step, url: location.href, site, ...meta, pageTitle: document.title, fields: [], capturedAt: Date.now(), final: true };
+    }
     if (!form) return reportJobPage(s);
-    const sig = formSignature(form);
+    const sig = form.final ? `final:${location.href}` : formSignature(form);
     if (sig !== s.sig) {
       // new questions: the next page/step of this application
       s.step = s.step + 1;
@@ -156,7 +163,7 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
       lastFill = null;
     }
     form.step = s.step;
-    const changed = !current || formSignature(current) !== sig;
+    const changed = !current || (current.final ? `final:${current.url}` : formSignature(current)) !== sig;
     current = form;
     if (!changed) return;
     const reply = (await send({ type: "form", form })) as BgStatus | undefined;
@@ -190,7 +197,7 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
         },
       });
     }
-    if (apply) getPill().show("Job page · the application starts after Apply", "ready", { action: { label: "Open application", onClick: () => realClick(apply) } });
+    if (apply) getPill().show("Ready to apply?", "ready", { action: { label: "Open application", onClick: () => realClick(apply) } });
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -272,19 +279,47 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
     const byId = new Map(form.fields.map((f) => [f.id, f]));
     const blocking = results.filter((r) => r.status !== "filled" && byId.get(r.fieldId)?.required);
     if (blocking.length) {
-      render();
-      return sendResponse({
+      sendResponse({
         results,
-        advance: { clicked: false, note: `Not moving on: required fields need the user first (${blocking.map((b) => b.label).join(", ")}). After they fix them they can click Next; then call wait_for_next_page.` },
+        advance: {
+          clicked: false,
+          note: `Not moving on yet: required fields need the user (${blocking.map((b) => b.label).join(", ")}). Tell them; once they're done the extension continues to the next page by itself. Call wait_for_next_page to pick it up.`,
+        },
       });
+      watchUntilFixed(form, blocking.map((b) => b.fieldId));
+      return;
     }
+    clickNext(form, results, sendResponse);
+  }
+
+  // After a blocked advance: wait for the user to fix the required fields, then continue by itself.
+  function watchUntilFixed(form: CapturedForm, ids: string[]) {
+    const labels = new Map(form.fields.map((f) => [f.id, f.label]));
+    getPill().show(`Needs you: ${ids.map((i) => labels.get(i)).join(", ")} · then I'll continue`, "warn", { force: true, action: { label: "Show ›", onClick: jumpToNeeds } });
+    const started = Date.now();
+    const iv = setInterval(() => {
+      const now = captureForm(formId, form.session, form.step);
+      if (!now || location.href !== form.url || Date.now() - started > 15 * 60_000) return clearInterval(iv); // moved on or gave up
+      const byId = new Map(now.fields.map((f) => [f.id, f]));
+      if (!ids.every((i) => byId.get(i)?.hasValue)) return;
+      clearInterval(iv);
+      let cancelled = false;
+      getPill().show("All set · continuing to the next page…", "working", { force: true, progress: 1, action: { label: "Wait", onClick: () => (cancelled = true) } });
+      setTimeout(() => {
+        if (cancelled) return render();
+        clickNext(form, [], null);
+      }, 3000);
+    }, 1000);
+  }
+
+  function clickNext(form: CapturedForm, results: FillResult[], sendResponse: ((r: FillResponse) => void) | null) {
     const btn = findNextButton();
     if (!btn) {
       render();
-      return sendResponse({ results, advance: { clicked: false, note: "No Next/Continue button on this page. It may be the last page: the user reviews and clicks Submit." } });
+      return sendResponse?.({ results, advance: { clicked: false, note: "No Next/Continue button on this page. It may be the last page: the user reviews and clicks Submit." } });
     }
     const label = describeButton(btn);
-    sendResponse({ results, advance: { clicked: true, button: label } });
+    sendResponse?.({ results, advance: { clicked: true, button: label } });
     getPill().show(`Filled ${results.filter((r) => r.status === "filled").length} · moving to the next page…`, "working", { force: true, progress: 1 });
     const urlBefore = location.href;
     const sigBefore = formSignature(form);
@@ -304,25 +339,12 @@ export function runOnPage(mode: "site" | "manual" | "lazy" = "site") {
 
   // ---------- submit detection ----------
 
-  function finalAnswers(): { question: string; answer: string }[] {
-    if (!current) return [];
-    const out: { question: string; answer: string }[] = [];
-    for (const f of current.fields) {
-      if (f.kind !== "textarea" && f.kind !== "text") continue;
-      const el = document.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[${ID_ATTR}="${CSS.escape(f.id)}"]`);
-      const box = el?.matches("input, textarea") ? el : el?.querySelector<HTMLTextAreaElement>("textarea, input");
-      const v = box?.value?.trim() ?? "";
-      if (v.length >= 40) out.push({ question: f.label, answer: v });
-    }
-    return out;
-  }
-
   // The background remembers the attempt; it is confirmed either here (single-page apps) or by
   // the thank-you page that loads next in the same tab (full-page submits).
   function onSubmitAttempt() {
     if (!current || submittedSent) return;
     const snapshot = { form: current, id: formId };
-    send({ type: "submit_attempt", formId, url: current.url, company: current.company, role: current.role, answers: finalAnswers() });
+    send({ type: "submit_attempt", formId, url: current.url, company: current.company, role: current.role });
     let checks = 0;
     const check = () => {
       checks++;

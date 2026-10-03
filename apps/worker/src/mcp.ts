@@ -1,46 +1,52 @@
 // The MCP server Claude / ChatGPT talk to. One server instance per request (stateless).
+// Minimal data: facts about the user come from the assistant's own memory with each request
+// (`facts`) and are never stored; the tracker keeps only company, role, URL, status, applied date.
 
 import { McpServer } from "@modelcontextprotocol/server";
 import { getMcpAuthContext } from "agents/mcp/server";
 import { env } from "cloudflare:workers";
 import { z } from "zod";
 import type { FormField } from "@job-copilot/shared";
-import type { FillOutcome, FormRecord } from "./room";
-import { suggestFor } from "./suggest";
 import {
+  RETENTION_MS,
   STATUSES,
-  deleteUserData,
-  listAnswers,
-  type SavedAnswer,
   applicationsToCsv,
-  deleteAnswer,
   deleteApplication,
-  getProfile,
+  deleteUserData,
   listApplications,
-  saveAnswer,
-  searchAnswers,
   updateApplication,
-  updateProfile,
   upsertApplication,
   type Application,
 } from "./db";
-import { detailsMore, discoverBoardUrl, discoverFromName, guessMore, parseMoreUrl, readJobPage, searchMore, type MoreAts } from "./boards";
-import { boardCandidates, filterJobs, findBoards, getJobDetails, greenhouseOptions, optionsForLabel, oracleBoardFor, parseJobUrl, searchOracle, type JobDetails, type JobSummary } from "./jobs";
+import { greenhouseOptions, optionsForLabel, parseJobUrl } from "./jobs";
+import type { FillOutcome, FormRecord } from "./room";
+import { jobDetails, searchCompany } from "./search";
+import { suggestFor } from "./suggest";
 
-const INSTRUCTIONS = `Job Copilot helps the user find jobs, fill job applications in their browser, and track applications.
+const NAME = "JobSeeker";
+
+// Sites whose applications span several pages: Next is clicked automatically after a clean fill.
+const MULTI_STEP_SITES = new Set(["workday", "oracle", "successfactors", "taleo", "icims"]);
+
+const FACT_KEYS =
+  "full_name, first_name, last_name, preferred_name, email, phone, city, country, linkedin, github, portfolio, current_company, current_title, years_experience, notice_period, current_ctc, expected_ctc, college, degree, graduation_year, cgpa, work_authorization (yes/no), requires_sponsorship (yes/no), willing_to_relocate (yes/no), work_preference (remote/hybrid/office), pronouns";
+
+const INSTRUCTIONS = `${NAME} helps the user find jobs, fill job applications in their browser, and track applications.
+
+${NAME} stores almost nothing about the user. Keep what you learn about them (name, contact details, experience, notice period, CTC, visa/sponsorship status, preferences, good answers to common questions) in YOUR memory, and pass the relevant facts as \`facts\` to get_open_forms / fill_form; they are used for that request only and never saved.
 
 Typical flow:
-1. Find jobs: search_jobs with a company name or any careers / job URL. It supports Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable, Recruitee and Oracle Recruiting Cloud, and detects the board from a careers page or from any single job posting URL. If a name isn't enough, it tells you what to web-search for; then pass the URL you find. get_job reads any job page. Show title, location and link; compare get_job's description with get_profile when asked about fit.
+1. Find jobs: search_jobs with a company name or any careers / job URL (Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable, Recruitee, Oracle; the board is detected from a careers page or any single job URL; if a name isn't enough it tells you what to web-search for). Results are the newest postings first, from the last 30 days by default (posted_within_days); use next_offset for more. get_job reads any job page; compare it with what you know about the user when asked about fit.
 2. When the user picks a job: track_application with status "Applying", then give them the apply_url (the page with the form; fall back to url). You cannot open tabs.
-3. The Job Copilot Chrome extension captures the form automatically. When the user says "fill it": call get_open_forms. Fields with a "suggested" value are already matched to the profile and saved answers; fill_form fills those by default, so only send answers for the remaining fields (use find_saved_answers for long questions). If get_open_forms shows job_pages_without_form, the user still has to click Apply.
-4. Multi-step forms (Workday, Oracle/JPMorgan, …): ask once whether the user wants you to move through the pages for them. If yes, use fill_form with advance=true; the response contains next_page, so keep filling page after page in the same turn. Otherwise call wait_for_next_page after each fill while they click Next. Never submit: stop at the final review/submit page.
+3. The ${NAME} Chrome extension captures the form. When the user says "fill it": call get_open_forms with facts. Fields with a "suggested" value are matched already and fill_form fills them by default, so only send answers for the remaining fields. If get_open_forms shows job_pages_without_form, the user still has to click Apply (the extension pill has an "Open application" button).
+4. Multi-page forms (multi_step: true, e.g. Workday, Oracle/JPMorgan): fill_form clicks Next/Continue for you after a clean fill and returns next_page; keep filling page after page in the same turn. Do NOT ask the user to click Next. Stop at the final review/submit page; never submit. If advance_note says required fields need the user, tell them which, then call wait_for_next_page (the extension continues once they're fixed).
 5. Tell the user which fields still need them (resume upload, anything you were unsure of). They review and click Submit; the extension then marks the application "Applied".
 
 Rules:
-- Never invent facts (CTC, notice period, visa status, years of experience, demographic answers, dates). If the profile lacks a required fact, ask the user, then save it with update_profile so it is suggested next time.
+- Never invent facts (CTC, notice period, visa status, years of experience, demographic answers, dates). If you don't know a required fact, ask the user and remember it.
 - Voluntary demographic/EEO questions are suggested as "decline to answer" unless the user says otherwise.
-- When the user approves a good long answer, save it with save_answer.
-- Keep answers within any maxLength and pick select/radio/checkbox values exactly from the listed options.`;
+- Keep answers within any maxLength and pick select/radio/checkbox values exactly from the listed options.
+- The tracker keeps only company, role, link, status and applied date, for 90 days after the last update. Keep notes (next steps, interview dates) in your memory.`;
 
 function userId(): string {
   const id = getMcpAuthContext()?.props?.userId;
@@ -61,11 +67,9 @@ const appView = (a: Application) => ({
   role: a.role,
   status: a.status,
   applied_on: fmtDate(a.applied_at),
-  next_step: a.next_step,
-  next_step_date: a.next_step_date,
-  notes: a.notes,
   url: a.url,
   updated: fmtDate(a.updated_at),
+  kept_until: fmtDate(a.updated_at + RETENTION_MS),
 });
 
 const fieldView = (f: FormField) => ({
@@ -75,97 +79,83 @@ const fieldView = (f: FormField) => ({
   ...(f.inputType && f.inputType !== "text" ? { type: f.inputType } : {}),
   ...(f.required ? { required: true } : {}),
   ...(f.options?.length ? { options: f.options } : {}),
-  ...(f.value && (Array.isArray(f.value) ? f.value.length : f.value.trim()) ? { current: f.value } : {}),
+  ...(f.hasValue ? { already_answered: true } : {}),
   ...(f.maxLength ? { maxLength: f.maxLength } : {}),
 });
 
 const statusEnum = z.enum(STATUSES);
-const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "YYYY-MM-DD");
+const factsSchema = z
+  .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string())]))
+  .optional()
+  .describe(`Facts about the user from your memory, used only for this request (never stored). Keys: ${FACT_KEYS}.`);
 
-const MORE: MoreAts[] = ["workday", "smartrecruiters", "workable", "recruitee"];
+type Facts = Record<string, unknown>;
 
-const jobView = (j: JobSummary) => ({
-  title: j.title,
-  location: j.location,
-  ...(j.department ? { team: j.department } : {}),
-  url: j.url,
-  ...(j.applyUrl && j.applyUrl !== j.url ? { apply_url: j.applyUrl } : {}),
-  job_ref: `${j.ats}:${j.board}:${j.id}`,
-  ...(j.updatedAt ? { posted: String(j.updatedAt).slice(0, 10) } : {}),
-});
+const isMultiStep = (rec: FormRecord) => MULTI_STEP_SITES.has(rec.form.site) || rec.form.step > 1;
 
-const isUrl = (s: string) => /^https?:\/\//i.test(s.trim());
-
-// Find the company's board and search it. Returns a result object or a message for Claude.
-async function searchCompany(company: string, keywords: string | undefined, location: string | undefined, limit: number, depth: number): Promise<object | string> {
-  const input = company.trim();
-
-  const oracle = oracleBoardFor(input);
-  if (oracle) {
-    const r = await searchOracle(oracle, keywords, location, limit);
-    if (!r) return "The company's Oracle careers site did not respond. Try again in a minute.";
-    return { board: `oracle:${oracle}`, matching: r.total, ...(r.locationNote ? { note: r.locationNote } : {}), jobs: r.jobs.map(jobView) };
-  }
-
-  const more = isUrl(input) ? parseMoreUrl(input) : null;
-  if (more) {
-    const r = await searchMore(more.ats, more.board, keywords, location, limit);
-    if (!r) return `The ${more.ats} board did not return jobs. Check the URL.`;
-    return { board: `${more.ats}:${more.board}`, total_open_roles: r.total, matching: r.jobs.length, jobs: r.jobs.map(jobView) };
-  }
-
-  if (isUrl(input) && !parseJobUrl(input)) {
-    // An unknown careers page: find the board it uses, else read it as a single job posting.
-    if (depth === 0) {
-      const boardUrl = await discoverBoardUrl(input);
-      if (boardUrl) return searchCompany(boardUrl, keywords, location, limit, 1);
-    }
-    const page = await readJobPage(input);
-    if (page && page.description.length > 300) {
-      return { board: `page:${page.board}`, note: "This is a single job page, not a job board.", jobs: [{ ...jobView(page), job_ref: undefined }] };
-    }
-    return "Couldn't find a job board on that page. Ask the user for the link to a specific job, or search the web for the role; the extension can still fill the application on any site.";
-  }
-
-  const jobs = await findBoards(input);
-  if (jobs) {
-    const matches = filterJobs(jobs, keywords, location);
-    return { board: `${jobs[0]!.ats}:${jobs[0]!.board}`, total_open_roles: jobs.length, matching: matches.length, jobs: matches.slice(0, limit).map(jobView) };
-  }
-  if (!isUrl(input)) {
-    const guess = await guessMore(boardCandidates(input), input, keywords, location, limit);
-    if (guess?.r) return { board: `${guess.ats}:${guess.board}`, total_open_roles: guess.r.total, matching: guess.r.jobs.length, jobs: guess.r.jobs.map(jobView) };
-    if (depth === 0) {
-      const found = await discoverFromName(input);
-      if (found) return searchCompany(found, keywords, location, limit, 1);
+// Greenhouse dropdowns don't expose options in the page; fill them in from Greenhouse's API.
+async function enrich(rec: FormRecord): Promise<FormRecord> {
+  const { form } = rec;
+  const ref = form.site === "greenhouse" ? parseJobUrl(form.url) : null;
+  if (ref?.id && form.fields.some((f) => f.kind === "select" && !f.options?.length)) {
+    const opts = await greenhouseOptions(ref.board, ref.id).catch(() => new Map<string, string[]>());
+    for (const f of form.fields) {
+      if (f.kind === "select" && !f.options?.length) f.options = optionsForLabel(opts, f.label);
     }
   }
-  return `No job board found for "${company}" from its name. Use web search to find ONE job posting or the job board of ${company} — e.g. search: ${company} careers (myworkdayjobs OR greenhouse OR lever OR ashbyhq OR smartrecruiters OR workable OR oraclecloud) — and call search_jobs again with that URL. Any single job URL on a job board is enough: the whole board is detected from it. If the company uses an unsupported system, get_job can still read any job page and the extension can fill the application.`;
+  return rec;
 }
 
-async function jobDetails(job: string): Promise<JobDetails | null> {
-  const parts = job.split(":");
-  if (!isUrl(job) && parts.length === 3) {
-    const [ats, board, id] = parts as [string, string, string];
-    if ((MORE as string[]).includes(ats)) return detailsMore(ats as MoreAts, board, id);
-    if (["greenhouse", "lever", "ashby", "oracle"].includes(ats)) return getJobDetails(ats as "greenhouse", board, id);
+function formView(rec: FormRecord, facts: Facts) {
+  const { form, lastFill } = rec;
+  const fields = form.fields.map((f) => {
+    const s = suggestFor(f, facts);
+    return { ...fieldView(f), ...(s ? { suggested: s.value, from: s.from } : {}) };
+  });
+  const open = fields.filter((f) => f.kind !== "file" && !("suggested" in f) && !("already_answered" in f));
+  const multi = isMultiStep(rec);
+  if (form.final) {
+    return {
+      form_id: form.formId,
+      company: form.company,
+      role: form.role,
+      site: form.site,
+      url: form.url,
+      final_review_page: true,
+      note: "This is the final review page: nothing left to fill. Stop here and ask the user to review the application and click Submit themselves.",
+    };
   }
-  if (!isUrl(job)) return null;
-  const known = parseJobUrl(job);
-  if (known?.id) return getJobDetails(known.ats, known.board, known.id);
-  const more = parseMoreUrl(job);
-  if (more?.id) {
-    const d = await detailsMore(more.ats, more.board, more.id);
-    if (d) return d;
-  }
-  return readJobPage(job);
+  return {
+    form_id: form.formId,
+    company: form.company,
+    role: form.role,
+    site: form.site,
+    url: form.url,
+    ...(form.step > 1 ? { page_step: form.step } : {}),
+    ...(multi
+      ? {
+          multi_step: true,
+          multi_step_note: `This application has several pages. fill_form clicks Next for you after a clean fill and returns the next page — keep going page by page; don't ask the user to click Next.`,
+        }
+      : {}),
+    fields_needing_your_answer: open.length,
+    fields,
+    ...(lastFill ? { last_fill: { at: new Date(lastFill.at).toISOString(), results: lastFill.results } } : {}),
+  };
+}
+
+function fillSummary(out: FillOutcome) {
+  const results = out.results ?? [];
+  const picked = results.filter((r) => r.status === "filled" && r.note);
+  return {
+    filled: results.filter((r) => r.status === "filled").length,
+    ...(picked.length ? { check_these: picked.map((r) => ({ field_id: r.fieldId, label: r.label, note: r.note })) } : {}),
+    not_filled: results.filter((r) => r.status !== "filled").map((r) => ({ field_id: r.fieldId, label: r.label, status: r.status, note: r.note })),
+  };
 }
 
 export function createServer() {
-  const server = new McpServer(
-    { name: "job-copilot", title: "Job Copilot", version: "0.1.0" },
-    { instructions: INSTRUCTIONS },
-  );
+  const server = new McpServer({ name: "jobseeker", title: NAME, version: "1.0.0" }, { instructions: INSTRUCTIONS });
 
   // ---------- jobs ----------
 
@@ -174,17 +164,19 @@ export function createServer() {
     {
       title: "Search a company's open jobs",
       description:
-        "Live open roles from a company's job board: Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable, Recruitee and Oracle (e.g. JPMorgan). Pass a company name (e.g. 'Stripe', 'NVIDIA', 'JPMorgan') or any careers/job-board URL (the board is detected from the page). Optionally filter by keywords and location.",
+        "Live open roles from a company's job board: Greenhouse, Lever, Ashby, Workday, SmartRecruiters, Workable, Recruitee and Oracle (e.g. JPMorgan). Pass a company name or any careers / job-board / job URL (the board is detected). Newest postings first; only the last `posted_within_days` days (default 30). Use next_offset to get more.",
       inputSchema: z.object({
-        company: z.string().min(1).describe("Company name, board slug, or careers / job board URL"),
+        company: z.string().min(1).describe("Company name, board slug, or careers / job board / job URL"),
         keywords: z.string().optional().describe("e.g. 'backend engineer'"),
         location: z.string().optional().describe("e.g. 'Bangalore', 'India', 'Remote'"),
+        posted_within_days: z.number().int().min(0).max(3650).default(30).describe("0 = any date"),
         limit: z.number().int().min(1).max(50).default(20),
+        offset: z.number().int().min(0).default(0),
       }),
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ company, keywords, location, limit }) => {
-      const r = await searchCompany(company, keywords, location, limit, 0);
+    async ({ company, keywords, location, posted_within_days, limit, offset }) => {
+      const r = await searchCompany(company, { keywords, location, limit, offset, postedWithinDays: posted_within_days });
       return typeof r === "string" ? text(r) : json(r);
     },
   );
@@ -207,6 +199,7 @@ export function createServer() {
         company: d.ats === "page" ? d.board : undefined,
         location: d.location,
         team: d.department,
+        ...(d.postedAt ? { posted: String(d.postedAt).slice(0, 10) } : {}),
         url: d.url,
         apply_url: d.applyUrl,
         description: d.description.length > maxDesc ? d.description.slice(0, maxDesc) + "…" : d.description,
@@ -215,130 +208,18 @@ export function createServer() {
     },
   );
 
-  // ---------- profile & saved answers ----------
-
-  server.registerTool(
-    "get_profile",
-    {
-      title: "Get the user's profile",
-      description:
-        "The user's saved application facts (name, contact, links, education, experience summary, notice period, expected CTC, work authorization, preferences…).",
-      inputSchema: z.object({}),
-      annotations: { readOnlyHint: true },
-    },
-    async () => {
-      const p = await getProfile(env.DB, userId());
-      return Object.keys(p).length ? json(p) : text("Profile is empty. Ask the user for the basics (or read their resume if they share it) and save them with update_profile.");
-    },
-  );
-
-  server.registerTool(
-    "update_profile",
-    {
-      title: "Update the user's profile",
-      description:
-        "Merge facts into the profile. Use these keys so forms get pre-filled: full_name, first_name, last_name, preferred_name, email, phone, city, country, linkedin, github, portfolio, current_company, current_title, years_experience, notice_period, current_ctc, expected_ctc, college, degree, graduation_year, cgpa, work_authorization (yes/no), requires_sponsorship (yes/no), willing_to_relocate (yes/no), work_preference (remote/hybrid/office), pronouns; plus free-form ones like skills, summary. Set a key to null to remove it. Only save what the user told you.",
-      inputSchema: z.object({
-        facts: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.array(z.string()), z.null()])),
-      }),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-    },
-    async ({ facts }) => json(await updateProfile(env.DB, userId(), facts)),
-  );
-
-  server.registerTool(
-    "find_saved_answers",
-    {
-      title: "Find saved answers",
-      description:
-        "Search answers the user wrote or approved before (e.g. 'why do you want to work here', 'describe a challenging project'). Reuse and adapt them for similar questions.",
-      inputSchema: z.object({ question: z.string().min(1), limit: z.number().int().min(1).max(10).default(5) }),
-      annotations: { readOnlyHint: true },
-    },
-    async ({ question, limit }) => {
-      const found = await searchAnswers(env.DB, userId(), question, limit);
-      return found.length
-        ? json(found.map((a) => ({ id: a.id, question: a.question, answer: a.answer, source: a.source })))
-        : text("No saved answers match.");
-    },
-  );
-
-  server.registerTool(
-    "save_answer",
-    {
-      title: "Save an answer",
-      description: "Save (or replace) the user's answer to a question so it can be reused in future applications. Only save answers the user approved.",
-      inputSchema: z.object({ question: z.string().min(3), answer: z.string().min(1) }),
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
-    },
-    async ({ question, answer }) => {
-      await saveAnswer(env.DB, userId(), question, answer, "claude");
-      return text("Saved.");
-    },
-  );
-
-  server.registerTool(
-    "delete_saved_answer",
-    {
-      title: "Delete a saved answer",
-      description: "Delete one saved answer by id (from find_saved_answers).",
-      inputSchema: z.object({ id: z.string() }),
-      annotations: { readOnlyHint: false, destructiveHint: true },
-    },
-    async ({ id }) => ((await deleteAnswer(env.DB, userId(), id)) ? text("Deleted.") : err("No such answer.")),
-  );
-
   // ---------- browser forms ----------
-
-  // Greenhouse dropdowns don't expose options in the page; fill them in from Greenhouse's API.
-  async function enrich(rec: FormRecord): Promise<FormRecord> {
-    const { form } = rec;
-    const ref = form.site === "greenhouse" ? parseJobUrl(form.url) : null;
-    if (ref?.id && form.fields.some((f) => f.kind === "select" && !f.options?.length)) {
-      const opts = await greenhouseOptions(ref.board, ref.id).catch(() => new Map<string, string[]>());
-      for (const f of form.fields) {
-        if (f.kind === "select" && !f.options?.length) f.options = optionsForLabel(opts, f.label);
-      }
-    }
-    return rec;
-  }
-
-  async function knowledge() {
-    const uid = userId();
-    const [profile, saved] = await Promise.all([getProfile(env.DB, uid), listAnswers(env.DB, uid)]);
-    return { profile, saved };
-  }
-
-  function formView(rec: FormRecord, k: { profile: Record<string, unknown>; saved: SavedAnswer[] }) {
-    const { form, lastFill } = rec;
-    const fields = form.fields.map((f) => {
-      const s = suggestFor(f, k.profile, k.saved);
-      return { ...fieldView(f), ...(s ? { suggested: s.value, from: s.from } : {}) };
-    });
-    const open = fields.filter((f) => f.kind !== "file" && !("suggested" in f) && !("current" in f));
-    return {
-      form_id: form.formId,
-      company: form.company,
-      role: form.role,
-      site: form.site,
-      url: form.url,
-      ...(form.step > 1 ? { page_step: form.step } : {}),
-      fields_needing_your_answer: open.length,
-      fields,
-      ...(lastFill ? { last_fill: { at: new Date(lastFill.at).toISOString(), results: lastFill.results } } : {}),
-    };
-  }
 
   server.registerTool(
     "get_open_forms",
     {
       title: "Get open application forms",
       description:
-        "Application forms the Chrome extension captured in the user's browser (most recent first): every field's id, label, kind, options, whether it is required, and a `suggested` value pre-matched from the profile/saved answers when one exists. Also lists job pages that are open without a form yet. Call this when the user asks to fill an application.",
-      inputSchema: z.object({ form_id: z.string().optional().describe("Return only this form") }),
+        "Application forms the Chrome extension captured in the user's browser (most recent first): every field's id, label, kind, options, whether it's required, and a `suggested` value matched from `facts` when possible. Also lists job pages open without a form yet. Call this when the user asks to fill an application, passing facts from your memory.",
+      inputSchema: z.object({ form_id: z.string().optional().describe("Return only this form"), facts: factsSchema }),
       annotations: { readOnlyHint: true },
     },
-    async ({ form_id }) => {
+    async ({ form_id, facts }) => {
       const r = room();
       const [status, forms, pages] = await Promise.all([r.status(), r.getForms(), r.getPages()]);
       const list = form_id ? forms.filter((f) => f.form.formId === form_id) : forms;
@@ -356,75 +237,89 @@ export function createServer() {
             extension_connected: status.extensionConnected,
             forms: [],
             job_pages_without_form: jobPages,
-            hint: "The user is on a job description page, not the application form. Ask them to click Apply (or the 'Open application' button on the Job Copilot pill), then call get_open_forms again.",
+            hint: "The user is on a job description page, not the application form. Ask them to click Apply (or 'Open application' on the JobSeeker pill), then call get_open_forms again.",
           });
         }
         return text(
           status.extensionConnected
-            ? "The extension is connected but no application form is open. Ask the user to open the job's application page (the apply_url from search_jobs), or, on a career site Job Copilot doesn't know, click the extension icon → 'Use on this page'. Then call get_open_forms again."
-            : "No open forms and the Chrome extension is not connected. Ask the user to install the Job Copilot extension, click Connect, and open the application page.",
+            ? `The extension is connected but no application form is open. Ask the user to open the job's application page (the apply_url from search_jobs), or, on a career site ${NAME} doesn't know, click the extension icon → 'Use on this page'. Then call get_open_forms again.`
+            : `No open forms and the ${NAME} Chrome extension is not connected. Ask the user to install the extension, click Connect, and open the application page.`,
         );
       }
-      const k = await knowledge();
       const recs = await Promise.all(list.map(enrich));
       return json({
         extension_connected: status.extensionConnected,
-        forms: recs.map((rec) => formView(rec, k)),
+        forms: recs.map((rec) => formView(rec, facts ?? {})),
         ...(jobPages.length ? { job_pages_without_form: jobPages } : {}),
       });
     },
   );
-
-  function fillSummary(out: FillOutcome) {
-    const results = out.results ?? [];
-    const picked = results.filter((r) => r.status === "filled" && r.note);
-    return {
-      filled: results.filter((r) => r.status === "filled").length,
-      ...(picked.length ? { check_these: picked.map((r) => ({ field_id: r.fieldId, label: r.label, note: r.note })) } : {}),
-      not_filled: results.filter((r) => r.status !== "filled").map((r) => ({ field_id: r.fieldId, label: r.label, status: r.status, note: r.note })),
-    };
-  }
 
   server.registerTool(
     "fill_form",
     {
       title: "Fill an application form",
       description:
-        "Fill an open form in the user's browser. By default every field's `suggested` value is filled too (fill_suggested), so only send answers for fields without a suggestion or where you want a different value. Values: for select/radio one of the options exactly, for checkbox an array of options; never file fields. With advance=true the extension clicks the page's Next/Continue button afterwards (never Submit) and the response includes the next page's fields, so you can fill multi-step forms in one go. The user always reviews and clicks Submit themselves.",
+        "Fill an open form in the user's browser. Every field's `suggested` value (from facts) is filled too unless fill_suggested is false, so only send answers for the other fields. Values: for select/radio one of the options exactly, for checkbox an array of options; never file fields. On multi-step forms the extension then clicks Next/Continue (never Submit) and the response includes next_page: keep filling. Pass advance=false only if the user wants to click Next themselves. The user always reviews and clicks Submit.",
       inputSchema: z.object({
         form_id: z.string(),
         answers: z.array(z.object({ field_id: z.string(), value: z.union([z.string(), z.array(z.string())]) })).default([]),
+        facts: factsSchema,
         fill_suggested: z.boolean().default(true),
-        advance: z.boolean().default(false).describe("Click Next/Continue after filling (multi-step forms). Never clicks Submit."),
+        advance: z.boolean().optional().describe("Click Next/Continue after filling. Defaults to true on multi-step forms. Never clicks Submit."),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ form_id, answers, fill_suggested, advance }) => {
+    async ({ form_id, answers, facts, fill_suggested, advance }) => {
       const r = room();
       const rec = await r.getForm(form_id);
       if (!rec) return err("That form is no longer open (the page changed or was closed). Call get_open_forms to see the current page.");
+      if (rec.form.final) return text("This is the final review page: nothing to fill. Ask the user to review the application and click Submit themselves.");
+      await enrich(rec);
       const merged = new Map(answers.map((a) => [a.field_id, a.value]));
-      let k: Awaited<ReturnType<typeof knowledge>> | undefined;
+      let suggested = 0;
       if (fill_suggested) {
-        k = await knowledge();
-        await enrich(rec);
         for (const f of rec.form.fields) {
           if (merged.has(f.id)) continue;
-          const s = suggestFor(f, k.profile, k.saved);
-          if (s) merged.set(f.id, s.value);
+          const s = suggestFor(f, facts ?? {});
+          if (s) {
+            merged.set(f.id, s.value);
+            suggested++;
+          }
         }
       }
-      if (!merged.size) return err("Nothing to fill: no answers given and no suggestions matched. Send answers for the fields.");
+      const doAdvance = advance ?? isMultiStep(rec);
+      if (!merged.size && !doAdvance) return err("Nothing to fill: no answers given and no suggestions matched. Send answers for the fields.");
       const out = await r.fill(
         form_id,
         [...merged].map(([fieldId, value]) => ({ fieldId, value })),
-        advance,
+        doAdvance,
+      );
+      const summary = fillSummary(out);
+      // Diagnostics only: no answers, no user data.
+      console.log(
+        JSON.stringify({
+          evt: "fill_form",
+          site: rec.form.site,
+          step: rec.form.step,
+          fields: rec.form.fields.length,
+          answers: answers.length,
+          suggested,
+          advance_requested: advance ?? null,
+          advance: doAdvance,
+          clicked: out.advance?.clicked ?? null,
+          advance_note: out.advance?.note ?? null,
+          next_page: !!out.nextForm,
+          filled: summary.filled,
+          not_filled: summary.not_filled.length,
+          error: out.error ?? null,
+        }),
       );
       if (out.error && !out.results) return err(out.error);
-      const next = out.nextForm ? formView(await enrich(out.nextForm), k ?? (await knowledge())) : undefined;
+      const next = out.nextForm ? formView(await enrich(out.nextForm), facts ?? {}) : undefined;
       return json({
-        ...fillSummary(out),
-        ...(advance
+        ...summary,
+        ...(doAdvance
           ? {
               advanced: out.advance?.clicked ?? false,
               ...(out.advance?.button ? { clicked_button: out.advance.button } : {}),
@@ -433,7 +328,7 @@ export function createServer() {
             }
           : {}),
         reminder: next
-          ? "Fill next_page the same way (fill_form with its form_id). Continue until the page with the final Submit button, then stop and let the user review and submit."
+          ? "Fill next_page the same way (fill_form with its form_id and facts). Continue until the final review/submit page, then stop and let the user review and submit."
           : "If a dropdown failed and its note lists the options, call fill_form again for just that field with an exact option. Tell the user what still needs them (e.g. resume upload) and that they should review and click Submit.",
       });
     },
@@ -444,14 +339,14 @@ export function createServer() {
     {
       title: "Wait for the next page of a form",
       description:
-        "For multi-step forms when the user clicks Next themselves: waits (up to ~50 s) until the extension captures the next page of the same application, then returns its fields. Call it right after fill_form when the user prefers to click Next; call it again if it times out and the user is still going.",
-      inputSchema: z.object({ form_id: z.string(), timeout_seconds: z.number().int().min(5).max(55).default(50) }),
+        "Waits (up to ~50 s) until the extension captures the next page of the same application, then returns its fields (with suggestions from facts). Use it when the user is fixing something or clicking Next themselves; call it again if it times out and the user is still going.",
+      inputSchema: z.object({ form_id: z.string(), timeout_seconds: z.number().int().min(5).max(55).default(50), facts: factsSchema }),
       annotations: { readOnlyHint: true },
     },
-    async ({ form_id, timeout_seconds }) => {
+    async ({ form_id, timeout_seconds, facts }) => {
       const next = await room().waitForNext(form_id, timeout_seconds * 1000);
-      if (!next) return text("No new page yet. If the user is still on this page, ask them to click Next (or offer to do it with fill_form advance=true), then call wait_for_next_page again.");
-      return json(formView(await enrich(next), await knowledge()));
+      if (!next) return text("No new page yet. If the user is still on this page, they may need to fix highlighted fields; call wait_for_next_page again.");
+      return json(formView(await enrich(next), facts ?? {}));
     },
   );
 
@@ -462,16 +357,8 @@ export function createServer() {
     {
       title: "Add or update a tracked application",
       description:
-        "Add a job to the user's application tracker, or update it if the same job (same URL, or same company + role) is already tracked. Use status 'Applying' when the user decides to apply.",
-      inputSchema: z.object({
-        company: z.string().min(1),
-        role: z.string().min(1),
-        url: z.string().url().optional(),
-        status: statusEnum.optional(),
-        next_step: z.string().nullable().optional().describe("e.g. 'OA on HackerRank', 'HR call'"),
-        next_step_date: dateStr.nullable().optional(),
-        notes: z.string().nullable().optional(),
-      }),
+        "Add a job to the user's tracker (company, role, link, status), or update it if the same job is already tracked. Use status 'Applying' when the user decides to apply. Entries are kept 90 days after their last update; keep notes in your memory.",
+      inputSchema: z.object({ company: z.string().min(1), role: z.string().min(1), url: z.string().url().optional(), status: statusEnum.optional() }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async (input) => {
@@ -484,17 +371,8 @@ export function createServer() {
     "update_application",
     {
       title: "Update an application",
-      description: "Change status, next step, notes etc. of a tracked application by id (from list_applications).",
-      inputSchema: z.object({
-        id: z.string(),
-        company: z.string().optional(),
-        role: z.string().optional(),
-        url: z.string().url().optional(),
-        status: statusEnum.optional(),
-        next_step: z.string().nullable().optional(),
-        next_step_date: dateStr.nullable().optional(),
-        notes: z.string().nullable().optional(),
-      }),
+      description: "Change company, role, link or status of a tracked application by id (from list_applications).",
+      inputSchema: z.object({ id: z.string(), company: z.string().optional(), role: z.string().optional(), url: z.string().url().optional(), status: statusEnum.optional() }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
     },
     async ({ id, ...patch }) => {
@@ -507,14 +385,13 @@ export function createServer() {
     "list_applications",
     {
       title: "List tracked applications",
-      description:
-        "The user's application tracker, most recently updated first. Filter by status or company. Use it for questions like 'what's due this week' or 'where haven't I heard back'.",
+      description: "The user's application tracker (last 90 days), most recently updated first. Filter by status or company.",
       inputSchema: z.object({ status: statusEnum.optional(), company: z.string().optional() }),
       annotations: { readOnlyHint: true },
     },
     async ({ status, company }) => {
       const apps = await listApplications(env.DB, userId(), { status, company });
-      if (!apps.length) return text("No tracked applications yet.");
+      if (!apps.length) return text("No tracked applications in the last 90 days.");
       const counts: Record<string, number> = {};
       for (const a of apps) counts[a.status] = (counts[a.status] ?? 0) + 1;
       return json({ today: new Date().toISOString().slice(0, 10), counts, applications: apps.map(appView) });
@@ -537,7 +414,7 @@ export function createServer() {
     {
       title: "Export the tracker as CSV",
       description:
-        "The whole application tracker as CSV. If the user wants it in Google Sheets and you have a Google Drive tool, create a file from this CSV (it converts to a Sheet); otherwise show it or offer it as a download.",
+        "The whole tracker as CSV. If the user wants it in Google Sheets and you have a Google Drive tool, create a file from this CSV (it converts to a Sheet); otherwise show it or offer it as a download.",
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true },
     },
@@ -547,15 +424,14 @@ export function createServer() {
   server.registerTool(
     "delete_my_data",
     {
-      title: "Delete all my Job Copilot data",
-      description:
-        "Permanently erase the user's profile, saved answers, application tracker and extension sign-ins. Only call this when the user explicitly asks to delete their data, after confirming; it cannot be undone.",
+      title: `Delete all my ${NAME} data`,
+      description: `Permanently erase the user's application tracker and extension sign-ins. Only call this when the user explicitly asks to delete their data, after confirming; it cannot be undone.`,
       inputSchema: z.object({ confirm: z.literal(true).describe("Must be true; confirm with the user first") }),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
     async () => {
       await deleteUserData(env.DB, userId());
-      return text("All Job Copilot data for this account was deleted. The browser extension is signed out; click Connect to use it again.");
+      return text(`All ${NAME} data for this account was deleted. The browser extension is signed out; click Connect to use it again.`);
     },
   );
 

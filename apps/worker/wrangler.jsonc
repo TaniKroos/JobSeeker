@@ -5,18 +5,22 @@
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Daily cleanup (90-day tracker retention, expired sign-ins).
+  "triggers": { "crons": ["17 3 * * *"] },
+  // Static files: logo, favicon, social image, screenshots (served before the Worker).
+  "assets": { "directory": "./public" },
   // Custom domain (zone must be in this Cloudflare account). The workers.dev URL keeps working too.
   "routes": [{ "pattern": "jobs.smudgee.xyz", "custom_domain": true }],
   // Keep request URLs as localhost in `wrangler dev` (otherwise they're rewritten to the custom domain).
   "dev": { "host": "localhost:8787" },
   "vars": {
-    "APP_NAME": "Job Copilot",
+    "APP_NAME": "JobSeeker",
     // Public base URL, e.g. https://jobs.example.com. Empty = this Worker's own URL (fine for *.workers.dev).
     "PUBLIC_URL": "",
     // Comma-separated Chrome extension IDs allowed to sign in (empty = any, fine for development)
     "EXTENSION_IDS": "",
-    // Shown on /privacy and /terms (e.g. support@smudgee.xyz). Empty = no contact line.
-    "CONTACT_EMAIL": ""
+    // Chrome Web Store listing URL, once published (the home page shows "coming soon" until then).
+    "CHROME_STORE_URL": ""
   },
   // OAuth grants/tokens for the Claude/ChatGPT connector (required by workers-oauth-provider).
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],
