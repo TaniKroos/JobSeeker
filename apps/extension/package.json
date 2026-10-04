@@ -10,7 +10,9 @@
     "typecheck": "wxt prepare && tsc --noEmit",
     "build:store": "wxt build --mode store",
     "zip:store": "wxt zip --mode store",
-    "assets": "node scripts/make-assets.mjs"
+    "assets": "node scripts/make-assets.mjs",
+    "build:edge": "wxt build -b edge",
+    "zip:edge": "wxt zip -b edge --mode store"
   },
   "devDependencies": {
     "playwright": "^1.63.0",

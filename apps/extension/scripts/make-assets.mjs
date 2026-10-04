@@ -16,6 +16,12 @@ for (const size of [16, 32, 48, 128]) {
   await page.screenshot({ path: path.join(root, `apps/extension/public/icon/${size}.png`), omitBackground: true });
 }
 
+// 300×300 store logo (required by the Microsoft Edge Add-ons store)
+fs.mkdirSync(path.join(root, "store-assets"), { recursive: true });
+await page.setViewportSize({ width: 300, height: 300 });
+await page.setContent(`<style>html,body{margin:0;background:transparent}svg{width:300px;height:300px;display:block}</style>${svg}`);
+await page.screenshot({ path: path.join(root, "store-assets/logo-300.png"), omitBackground: true });
+
 // 1200×630 social preview for jobs.smudgee.xyz
 await page.setViewportSize({ width: 1200, height: 630 });
 await page.setContent(`<style>

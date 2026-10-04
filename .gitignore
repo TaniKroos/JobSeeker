@@ -7,3 +7,5 @@ worker-configuration.d.ts
 oc.md
 plan.md
 docs/
+.playwright-mcp
+store-assets
