@@ -73,7 +73,7 @@ export function boardCandidates(company: string): string[] {
 
 // Companies like Stripe host Greenhouse jobs on their own site; the embeddable form on
 // greenhouse.io goes straight to the application (and the extension runs there).
-const greenhouseApplyUrl = (board: string, id: string, absolute: string) =>
+export const greenhouseApplyUrl = (board: string, id: string, absolute: string) =>
   /greenhouse\.io/.test(absolute) ? absolute : `https://job-boards.greenhouse.io/embed/job_app?for=${board}&token=${id}`;
 
 async function greenhouseJobs(board: string): Promise<JobSummary[] | null> {

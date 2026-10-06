@@ -19,6 +19,9 @@ import {
   type Application,
 } from "./db";
 import { greenhouseOptions, optionsForLabel, parseJobUrl } from "./jobs";
+import { RADAR_ATS, type RadarAts } from "./radar/adapters";
+import { radarConfig } from "./radar/config";
+import { MARKS, addCompany, getNewJobs, listWatchlist, markJobs, radarHealth, resolveBoard, setCompanyActive } from "./radar/store";
 import type { FillOutcome, FormRecord } from "./room";
 import { jobDetails, searchCompany } from "./search";
 import { suggestFor } from "./suggest";
@@ -42,11 +45,18 @@ Typical flow:
 4. Multi-page forms (multi_step: true, e.g. Workday, Oracle/JPMorgan): fill_form clicks Next/Continue for you after a clean fill and returns next_page; keep filling page after page in the same turn. Do NOT ask the user to click Next. Stop at the final review/submit page; never submit. If advance_note says required fields need the user, tell them which, then call wait_for_next_page (the extension continues once they're fixed).
 5. Tell the user which fields still need them (resume upload, anything you were unsure of). They review and click Submit; the extension then marks the application "Applied".
 
+Job radar: ${NAME} also polls a watchlist of company job boards every 30 minutes and records jobs the moment they appear (strong matches alert the owner on Telegram). For a digest: get_new_jobs (e.g. since_hours 12, min_score 40), skip jobs already in list_applications, open the best with get_job to check experience/location/stack, rank them, then mark_jobs them "digested" (or "dismissed"). Manage it with watchlist_list / watchlist_add / watchlist_remove and check it with radar_health.
+
 Rules:
 - Never invent facts (CTC, notice period, visa status, years of experience, demographic answers, dates). If you don't know a required fact, ask the user and remember it.
 - Voluntary demographic/EEO questions are suggested as "decline to answer" unless the user says otherwise.
 - Keep answers within any maxLength and pick select/radio/checkbox values exactly from the listed options.
 - The tracker keeps only company, role, link, status and applied date, for 90 days after the last update. Keep notes (next steps, interview dates) in your memory.`;
+
+function isRadarOwner(): boolean {
+  const email = getMcpAuthContext()?.props?.email;
+  return typeof email === "string" && radarConfig(env).owners.includes(email.toLowerCase());
+}
 
 function userId(): string {
   const id = getMcpAuthContext()?.props?.userId;
@@ -206,6 +216,120 @@ export function createServer() {
         application_questions: d.questions,
       });
     },
+  );
+
+  // ---------- job radar ----------
+
+  server.registerTool(
+    "get_new_jobs",
+    {
+      title: "New jobs found by the radar",
+      description:
+        "Jobs the radar first saw in the last `since_hours` (it polls a watchlist of company job boards every 30 minutes), best match first. `score` (0–100) is a rough rule-based match on title and location only: open promising ones with get_job (job_ref) to check experience and stack. status 'new' = not yet marked by this user; mark them with mark_jobs after the digest.",
+      inputSchema: z.object({
+        since_hours: z.number().min(1).max(720).default(12),
+        min_score: z.number().int().min(0).max(100).default(40),
+        status: z.enum(["new", "all", ...MARKS]).default("new"),
+        company: z.string().optional(),
+        limit: z.number().int().min(1).max(100).default(50),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since_hours, min_score, status, company, limit }) => {
+      const r = await getNewJobs(env.DB, userId(), { sinceHours: since_hours, minScore: min_score, status, company, limit });
+      if (!r.jobs.length) return text(`No ${status === "all" ? "" : status + " "}radar jobs with score ≥ ${min_score} in the last ${since_hours} h.`);
+      return json({ returned: r.jobs.length, ...(r.more ? { note: "More match; raise min_score or limit." } : {}), jobs: r.jobs });
+    },
+  );
+
+  server.registerTool(
+    "mark_jobs",
+    {
+      title: "Mark radar jobs",
+      description: "Mark radar jobs (job_refs from get_new_jobs) as digested, dismissed or applied, so get_new_jobs status 'new' skips them. Marks are kept 30 days.",
+      inputSchema: z.object({ job_refs: z.array(z.string()).min(1).max(200), status: z.enum(MARKS) }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ job_refs, status }) => text(`Marked ${await markJobs(env.DB, userId(), job_refs, status)} of ${job_refs.length} as ${status}.`),
+  );
+
+  server.registerTool(
+    "watchlist_list",
+    {
+      title: "List the radar watchlist",
+      description: "Companies whose job boards the radar polls, with priority (1: every 30 min, 2: hourly, 3: every 2 hours), jobs on the board and any polling error.",
+      inputSchema: z.object({ query: z.string().optional(), ats: z.enum(RADAR_ATS as [RadarAts, ...RadarAts[]]).optional(), include_inactive: z.boolean().default(false) }),
+      annotations: { readOnlyHint: true },
+    },
+    async ({ query, ats, include_inactive }) => {
+      const rows = await listWatchlist(env.DB, { query, ats, includeInactive: include_inactive });
+      return json({
+        count: rows.length,
+        companies: rows.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          board: `${c.ats}:${c.board}`,
+          priority: c.priority,
+          ...(c.active ? {} : { active: false }),
+          ...(c.job_count != null ? { jobs_on_board: c.job_count } : { polled: false }),
+          ...(c.fail_count ? { failing: c.fail_count, error: c.last_error } : {}),
+        })),
+      });
+    },
+  );
+
+  server.registerTool(
+    "watchlist_add",
+    {
+      title: "Add a company to the radar",
+      description:
+        "Add a company (or change its priority) by name or by any careers / job URL; its job board is detected. Supported: Greenhouse, Lever, Ashby, Workday and Oracle (filtered to `location`, default India), SmartRecruiters, Workable, Recruitee. Jobs already on the board are not reported as new. Owner only.",
+      inputSchema: z.object({
+        company: z.string().min(1).describe("Company name, or a careers / job board / job URL"),
+        name: z.string().optional().describe("Display name, if `company` is a URL"),
+        priority: z.number().int().min(1).max(3).default(2),
+        location: z.string().optional().describe("Workday / Oracle only: location to filter the board by (default India)"),
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ company, name, priority, location }) => {
+      if (!isRadarOwner()) return err("Only the radar owner can change the watchlist.");
+      const hit = await resolveBoard(company.trim());
+      if (typeof hit === "string") return err(hit);
+      const display = name ?? (/^https?:\/\//i.test(company) ? hit.board.split("/").pop()! : company.trim());
+      try {
+        const row = await addCompany(env.DB, display, hit.ats, hit.board, priority, location ? { location } : {});
+        return json({ added: !row.polled_before, company: { id: row.id, name: row.name, board: `${row.ats}:${row.board}`, priority: row.priority, jobs_on_board: row.jobs_on_board } });
+      } catch (e) {
+        return err(`The ${hit.ats} board "${hit.board}" didn't answer (${e instanceof Error ? e.message : e}). Check the URL.`);
+      }
+    },
+  );
+
+  server.registerTool(
+    "watchlist_remove",
+    {
+      title: "Remove a company from the radar",
+      description: "Stop polling a company (id from watchlist_list). Its past jobs stay until they expire; watchlist_add turns it back on. Owner only.",
+      inputSchema: z.object({ id: z.number().int() }),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ id }) => {
+      if (!isRadarOwner()) return err("Only the radar owner can change the watchlist.");
+      const row = await setCompanyActive(env.DB, id, false);
+      return row ? text(`Stopped polling ${row.name} (${row.ats}:${row.board}).`) : err("No company with that id.");
+    },
+  );
+
+  server.registerTool(
+    "radar_health",
+    {
+      title: "Radar health",
+      description: "Is the radar running: companies polled in the last hour, failing boards and their errors, the last tick, jobs found and alerts sent in the last 24 h.",
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true },
+    },
+    async () => json(await radarHealth(env)),
   );
 
   // ---------- browser forms ----------
@@ -425,7 +549,7 @@ export function createServer() {
     "delete_my_data",
     {
       title: `Delete all my ${NAME} data`,
-      description: `Permanently erase the user's application tracker and extension sign-ins. Only call this when the user explicitly asks to delete their data, after confirming; it cannot be undone.`,
+      description: `Permanently erase the user's application tracker, radar job marks and extension sign-ins. Only call this when the user explicitly asks to delete their data, after confirming; it cannot be undone.`,
       inputSchema: z.object({ confirm: z.literal(true).describe("Must be true; confirm with the user first") }),
       annotations: { readOnlyHint: false, destructiveHint: true },
     },

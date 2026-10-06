@@ -70,7 +70,7 @@ export function parseWorkdayUrl(u: URL): { board: string; id?: string } | null {
   return { board: `${u.hostname}/${tenant}/${site}`, id };
 }
 
-interface WdFacetValue {
+export interface WdFacetValue {
   descriptor?: string;
   id?: string;
   count?: number;
@@ -79,7 +79,7 @@ interface WdFacetValue {
 }
 
 // Location facets are nested (e.g. locationMainGroup → locations / locationHierarchy1).
-function workdayLocationFacet(facets: WdFacetValue[], location: string): { param: string; id: string } | null {
+export function workdayLocationFacet(facets: WdFacetValue[], location: string): { param: string; id: string } | null {
   const want = location.toLowerCase().replace(/^bangalore\b/, "bengaluru").trim();
   const leaves: { param: string; id: string; name: string; specific: boolean }[] = [];
   const walk = (list: WdFacetValue[] | undefined, param: string | undefined) => {

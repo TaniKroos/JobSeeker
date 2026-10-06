@@ -175,8 +175,8 @@ const call = async (name, args = {}) => {
 };
 
 const tools = (await client.listTools()).tools.map((t) => t.name).sort();
-const expected = ["delete_application", "delete_my_data", "export_applications", "fill_form", "get_job", "get_open_forms", "list_applications", "search_jobs", "track_application", "update_application", "wait_for_next_page"];
-ok(JSON.stringify(tools) === JSON.stringify(expected), `11 tools, no profile/answer tools (${tools.join(", ")})`);
+const expected = ["delete_application", "delete_my_data", "export_applications", "fill_form", "get_job", "get_new_jobs", "get_open_forms", "list_applications", "mark_jobs", "radar_health", "search_jobs", "track_application", "update_application", "wait_for_next_page", "watchlist_add", "watchlist_list", "watchlist_remove"];
+ok(JSON.stringify(tools) === JSON.stringify(expected), `17 tools, no profile/answer tools (${tools.join(", ")})`);
 
 // ---------- job search: recency, paging, boards ----------
 const sorted = (jobs) => jobs.every((j, i) => i === 0 || (jobs[i - 1].posted ?? "").replace("before ", "") >= (j.posted ?? "").replace("before ", ""));
@@ -286,10 +286,85 @@ const lp = await call("get_open_forms");
 ok(lp.data.job_pages_without_form?.[0]?.apply_link?.endsWith("/apply") && /click Apply/.test(lp.data.hint), "a job page without a form tells Claude the user must click Apply");
 ok(ext.gotPong === true, "keep-alive ping answered");
 
+// ---------- job radar ----------
+// Needs `wrangler dev --test-scheduled --var RADAR_OWNER_EMAIL:radar-owner@example.com` (see README).
+if (LOCAL) {
+  // Run the radar cron once (wrangler dev --test-scheduled). Fresh connection: dev closes idle keep-alives.
+  const runTick = async () => {
+    const url = `${BASE}/__scheduled?cron=${encodeURIComponent("*/30 * * * *")}`;
+    return fetch(url, { headers: { connection: "close" } }).catch(() => fetch(url, { headers: { connection: "close" } }));
+  };
+  // Start from a radar that has never polled (local DB only).
+  sql("UPDATE companies SET seen_ids = NULL, etag = NULL, body_hash = NULL, opts = NULL, last_polled_at = NULL, fail_count = 0, last_error = NULL, active = 1; DELETE FROM jobs; DELETE FROM job_marks; DELETE FROM radar_state; DELETE FROM companies WHERE board = 'ramp'");
+  const wl = await call("watchlist_list");
+  ok(wl.data.count >= 100, `seeded watchlist: ${wl.data.count} companies`);
+  const denied = await call("watchlist_add", { company: "https://jobs.lever.co/hevodata" });
+  ok(denied.isError && /owner/.test(denied.text), "only the radar owner can change the watchlist");
+
+  const tick = await runTick();
+  ok(tick.ok, "radar cron runs");
+  const state = sql("SELECT value FROM radar_state WHERE key = 'last_tick'")[0];
+  const t = state ? JSON.parse(state.value) : {};
+  ok(t.polled > 0 && t.polled <= 42 && t.subrequests_left >= 0, `tick polled ${t.polled} (changed ${t.changed}, failed ${t.failed}, deferred ${t.deferred}, ${t.ms} ms)`);
+  const baselined = sql("SELECT count(*) AS n FROM companies WHERE seen_ids IS NOT NULL")[0].n;
+  ok(baselined > 0 && sql("SELECT count(*) AS n FROM jobs")[0].n === 0, `first poll records ${baselined} boards as a baseline, no jobs reported as new`);
+
+  // A job disappears from our memory of a board → the next poll reports it as new, once.
+  const gh = sql("SELECT id, seen_ids FROM companies WHERE ats = 'greenhouse' AND seen_ids IS NOT NULL AND job_count > 5 LIMIT 1")[0];
+  if (gh) {
+    const ids = JSON.parse(gh.seen_ids);
+    sql(`UPDATE companies SET seen_ids = '${JSON.stringify(ids.slice(2)).replace(/'/g, "''")}', etag = NULL, body_hash = NULL, last_polled_at = 0 WHERE id = ${gh.id}`);
+    sql(`UPDATE companies SET active = 0 WHERE id != ${gh.id}`);
+    await runTick();
+    sql("UPDATE companies SET active = 1");
+    const found = sql(`SELECT id, score, reject FROM jobs WHERE company_id = ${gh.id}`);
+    ok(found.length === 2 && found.every((j) => j.id.startsWith("greenhouse:")), `new job ids are recorded (${found.map((j) => j.score + (j.reject ? "/" + j.reject : "")).join(", ")})`);
+  }
+
+  // get_new_jobs / mark_jobs, with a known job
+  const cid = sql("SELECT id FROM companies WHERE board = 'stripe'")[0].id;
+  sql(`INSERT INTO jobs (id, company_id, title, location, url, first_seen_at, score) VALUES ('greenhouse:stripe:e2e1', ${cid}, 'Backend Engineer (GenAI)', 'Gurugram', 'https://stripe.com/jobs/e2e1', ${Date.now()}, 88), ('greenhouse:stripe:e2e2', ${cid}, 'Senior Engineer', 'Gurugram', 'https://stripe.com/jobs/e2e2', ${Date.now()}, 0)`);
+  const nj = await call("get_new_jobs", { min_score: 40 });
+  const mine = nj.data.jobs?.find((j) => j.job_ref === "greenhouse:stripe:e2e1");
+  ok(mine?.company === "Stripe" && mine.score === 88 && /min ago/.test(mine.first_seen), "get_new_jobs returns the job with company, score and first-seen age");
+  ok(!nj.data.jobs?.some((j) => j.job_ref === "greenhouse:stripe:e2e2"), "min_score hides rejected jobs");
+  const mk = await call("mark_jobs", { job_refs: ["greenhouse:stripe:e2e1", "greenhouse:nope:1"], status: "digested" });
+  ok(/Marked 1 of 2/.test(mk.text), "mark_jobs ignores unknown job_refs");
+  const after = await call("get_new_jobs", { min_score: 40 });
+  ok(typeof after.data === "string" || !after.data.jobs.some((j) => j.job_ref === "greenhouse:stripe:e2e1"), "marked jobs leave the 'new' list");
+  ok((await call("get_new_jobs", { status: "digested" })).data.jobs?.[0]?.status === "digested", "status filter finds digested jobs");
+  const health = await call("radar_health");
+  ok(health.data.companies?.active >= 100 && health.data.last_tick?.polled > 0 && health.data.alerts?.telegram === false, "radar_health reports companies, last tick and alert setup");
+
+  // Owner: add a board by URL, then remove it
+  const ownerToken = await connectorToken("radar-owner@example.com");
+  const owner = new Client({ name: "e2e-owner", version: "0.0.1" });
+  await owner.connect(new StreamableHTTPClientTransport(new URL(`${BASE}/mcp`), { requestInit: { headers: { authorization: `Bearer ${ownerToken}` } } }));
+  const ocall = async (name, args = {}) => {
+    const r = await owner.callTool({ name, arguments: args });
+    const tx = r.content?.[0]?.text ?? "";
+    try {
+      return { isError: r.isError, data: JSON.parse(tx), text: tx };
+    } catch {
+      return { isError: r.isError, data: tx, text: tx };
+    }
+  };
+  const added = await ocall("watchlist_add", { company: "https://jobs.ashbyhq.com/ramp", name: "Ramp", priority: 3 });
+  ok(!added.isError && added.data.company?.board === "ashby:ramp" && added.data.company.jobs_on_board > 0, `owner adds a board by URL (${added.data.company?.jobs_on_board} jobs)`);
+  const byName = await ocall("watchlist_add", { company: "Postman" });
+  ok(!byName.isError || /No supported job board/.test(byName.text), `add by name: ${byName.data.company?.board ?? byName.text.slice(0, 60)}`);
+  const ownerSees = await ocall("get_new_jobs", { min_score: 40 });
+  ok(ownerSees.data.jobs?.some((j) => j.job_ref === "greenhouse:stripe:e2e1"), "marks are per user: the job is still new for someone else");
+  const rm = await ocall("watchlist_remove", { id: added.data.company?.id ?? -1 });
+  ok(/Stopped polling Ramp/.test(rm.text) && (await call("watchlist_list", { query: "ramp" })).data.count === 0, "watchlist_remove stops polling");
+  await owner.close();
+}
+
 // ---------- delete my data ----------
 const del = await call("delete_my_data", { confirm: true });
 ok(!del.isError && (await call("list_applications")).text.startsWith("No tracked"), "delete_my_data erases the tracker");
 ok((await wsTicket(extToken)) === null, "...and signs the extension out");
+if (LOCAL) ok(sql("SELECT count(*) AS n FROM job_marks m JOIN users u ON u.id = m.user_id WHERE u.email = '" + EMAIL + "'")[0].n === 0, "...and erases radar marks");
 
 ext.ws.close();
 await client.close();

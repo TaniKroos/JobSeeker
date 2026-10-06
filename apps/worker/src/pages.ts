@@ -87,6 +87,7 @@ export function privacyPage(): Response {
 <table><tr><th>Data</th><th>Why</th><th>How long</th></tr>
 <tr><td>Your email address and Google account ID (from “Continue with Google”; scopes <code>openid</code> and <code>email</code> only)</td><td>To know which account is yours</td><td>Until you ask us to delete your account</td></tr>
 <tr><td>Applications you track: company, role, job link, status, applied date</td><td>Your application list</td><td>Deleted 90 days after the last update</td></tr>
+<tr><td>Which job-radar postings you marked as reviewed, dismissed or applied (the posting's ID and the mark)</td><td>So your assistant doesn't show them again</td><td>Deleted after 30 days</td></tr>
 <tr><td>The questions on an application page you have open (labels, options, whether each is answered; <b>not</b> what you typed)</td><td>So your assistant can answer them</td><td>Up to 1 hour, or until you close the page</td></tr>
 <tr><td>Sign-in tokens for the connector and the extension (stored hashed or encrypted)</td><td>Keeping you signed in</td><td>Until they expire (extension: 90 days) or you sign out</td></tr></table>
 
@@ -108,7 +109,7 @@ export function privacyPage(): Response {
 
 <h2>Your rights</h2>
 <p>Under India's Digital Personal Data Protection Act, 2023 (and similar laws where you live) you can ask to access, correct or erase your data, and raise a grievance. You can:</p>
-<ul><li>ask your assistant to “delete my JobSeeker data” (erases your application list and signs out the extension),</li>
+<ul><li>ask your assistant to “delete my JobSeeker data” (erases your application list and radar marks, and signs out the extension),</li>
 <li>disconnect the connector and remove the extension to stop all access,</li>
 <li>email us at <a href="mailto:${CONTACT}">${CONTACT}</a> for anything else, including deleting your account. We reply within 30 days.</li></ul>
 

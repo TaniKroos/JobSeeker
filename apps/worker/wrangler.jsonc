@@ -5,8 +5,8 @@
   "compatibility_date": "2026-09-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // Daily cleanup (90-day tracker retention, expired sign-ins).
-  "triggers": { "crons": ["17 3 * * *"] },
+  // Daily cleanup (90-day tracker retention, expired sign-ins, 30-day radar jobs), and the job radar every 30 minutes.
+  "triggers": { "crons": ["17 3 * * *", "*/30 * * * *"] },
   // Static files: logo, favicon, social image, screenshots (served before the Worker).
   "assets": { "directory": "./public" },
   // Custom domain (zone must be in this Cloudflare account). The workers.dev URL keeps working too.
@@ -20,7 +20,15 @@
     // Comma-separated Chrome extension IDs allowed to sign in (empty = any, fine for development)
     "EXTENSION_IDS": "",
     // Chrome Web Store listing URL, once published (the home page shows "coming soon" until then).
-    "CHROME_STORE_URL": ""
+    "CHROME_STORE_URL": "",
+    // Job radar (src/radar). Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, RADAR_OWNER_EMAIL (who may edit the watchlist).
+    // Sized for the Workers Free plan (50 subrequests, ~10 ms CPU per run); raise on Workers Paid.
+    "RADAR_BATCH": "42",
+    "RADAR_SUBREQUESTS": "48",
+    "RADAR_PARSE_BYTES": "800000",
+    "RADAR_ALERT_MIN_SCORE": "70",
+    "RADAR_QUIET_HOURS": "23-7",
+    "RADAR_TIME_ZONE": "Asia/Kolkata"
   },
   // OAuth grants/tokens for the Claude/ChatGPT connector (required by workers-oauth-provider).
   "kv_namespaces": [{ "binding": "OAUTH_KV" }],

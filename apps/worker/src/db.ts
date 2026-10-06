@@ -208,6 +208,7 @@ export async function deleteUserData(db: D1Database, userId: string): Promise<vo
   await db.batch([
     db.prepare("DELETE FROM applications WHERE user_id = ?").bind(userId),
     db.prepare("DELETE FROM ext_tokens WHERE user_id = ?").bind(userId),
+    db.prepare("DELETE FROM job_marks WHERE user_id = ?").bind(userId),
   ]);
 }
 

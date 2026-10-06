@@ -3,8 +3,12 @@ import { createMcpHandler } from "agents/mcp/server";
 import app from "./app";
 import { purgeExpired } from "./db";
 import { createServer } from "./mcp";
+import { purgeRadar, runRadar } from "./radar/poller";
 
 export { UserRoom } from "./room";
+
+// Must match the daily entry in wrangler.jsonc "triggers"; every other cron runs the radar.
+const DAILY_CRON = "17 3 * * *";
 
 const mcpHandler = createMcpHandler(createServer, { route: "/mcp" });
 
@@ -35,9 +39,16 @@ export default {
     const base = (env.PUBLIC_URL || new URL(request.url).origin).replace(/\/$/, "");
     return getProvider({ ...env, PUBLIC_URL: base }, base).fetch(request, { ...env, PUBLIC_URL: base }, ctx);
   },
-  // Daily: delete applications older than 90 days and expired extension sign-ins.
-  async scheduled(_event, env) {
-    const removed = await purgeExpired(env.DB);
-    console.log(JSON.stringify({ evt: "purge", ...removed }));
+  async scheduled(event, env) {
+    // Daily: delete applications older than 90 days, expired extension sign-ins, radar jobs older than 30 days.
+    if (event.cron === DAILY_CRON) {
+      const removed = await purgeExpired(env.DB);
+      const radar = await purgeRadar(env.DB);
+      console.log(JSON.stringify({ evt: "purge", ...removed, radar_jobs: radar.jobs, radar_marks: radar.marks }));
+      return;
+    }
+    // Every 30 minutes: poll the due part of the radar watchlist.
+    const tick = await runRadar(env);
+    console.log(JSON.stringify({ evt: "radar_tick", ...tick }));
   },
 } satisfies ExportedHandler<Env>;
